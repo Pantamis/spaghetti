@@ -87,6 +87,12 @@ impl Table {
     }
 }
 
+/// Independent product chains in `batch_invert`: one chain would make every
+/// multiplication wait for the previous one (latency bound); `LANES`
+/// interleaved chains keep the multiplier busy. Lane `k` holds the indices
+/// `i ≡ k (mod LANES)`.
+const LANES: usize = 4;
+
 /// Inverts every element of `values` with one field inversion.
 /// `scratch` and `out` must have the same length as `values`.
 /// Returns `false` (leaving `out` unspecified) if any value is zero.
@@ -97,19 +103,37 @@ pub fn batch_invert(values: &[Fe], scratch: &mut [Fe], out: &mut [Fe]) -> bool {
     }
     let scratch = &mut scratch[..n];
     let out = &mut out[..n];
-    scratch[0] = values[0];
-    for i in 1..n {
-        scratch[i] = scratch[i - 1].mul(&values[i]);
+    // Forward pass: scratch[i] = values[i mod LANES] · … · values[i - LANES] · values[i].
+    let head = LANES.min(n);
+    scratch[..head].copy_from_slice(&values[..head]);
+    for i in LANES..n {
+        scratch[i] = scratch[i - LANES].mul(&values[i]);
     }
-    if scratch[n - 1].is_zero() {
+    // The lane totals are the last `head` entries (one per lane); invert their
+    // product once and split it with Montgomery's trick over the lanes.
+    let totals = &scratch[n - head..];
+    let mut prefix = [Fe::ONE; LANES];
+    for k in 1..head {
+        prefix[k] = prefix[k - 1].mul(&totals[k - 1]);
+    }
+    let all = prefix[head - 1].mul(&totals[head - 1]);
+    if all.is_zero() {
         return false;
     }
-    let mut inv = scratch[n - 1].invert();
-    for i in (1..n).rev() {
-        out[i] = inv.mul(&scratch[i - 1]);
-        inv = inv.mul(&values[i]);
+    let mut inv = all.invert();
+    // state[lane] = 1 / (product of that lane), indexed by the lane of the total.
+    let mut state = [Fe::ZERO; LANES];
+    for k in (0..head).rev() {
+        state[(n - head + k) % LANES] = inv.mul(&prefix[k]);
+        inv = inv.mul(&totals[k]);
     }
-    out[0] = inv;
+    // Backward pass: out[i] = state · scratch[i - LANES]; state ·= values[i].
+    for i in (LANES..n).rev() {
+        let lane = i % LANES;
+        out[i] = state[lane].mul(&scratch[i - LANES]);
+        state[lane] = state[lane].mul(&values[i]);
+    }
+    out[..head].copy_from_slice(&state[..head]);
     true
 }
 
@@ -149,6 +173,30 @@ pub struct Found {
 pub enum Mode {
     Random,
     Split { base: ProjectivePoint },
+}
+
+/// Per-point callback of [`Worker::batch`]. Implemented for closures; hot
+/// visitors implement it directly with `#[inline(always)]` on `visit`: the
+/// compiler does not inline a closure this large into the batch loop by
+/// itself, and the call boundary (x through memory, spills) costs about 30%.
+pub trait Visit {
+    fn visit(&mut self, offset: i64, x: &Fe);
+
+    /// `visit(offset, x_plus)` then `visit(-offset, x_minus)`. Hot visitors
+    /// override it to do all their arithmetic before any branch: the compiler
+    /// schedules within basic blocks, and the match checks split them.
+    #[inline(always)]
+    fn visit_pair(&mut self, offset: i64, x_plus: &Fe, x_minus: &Fe) {
+        self.visit(offset, x_plus);
+        self.visit(-offset, x_minus);
+    }
+}
+
+impl<F: FnMut(i64, &Fe)> Visit for F {
+    #[inline(always)]
+    fn visit(&mut self, offset: i64, x: &Fe) {
+        self(offset, x)
+    }
 }
 
 pub struct Worker<'a> {
@@ -211,13 +259,20 @@ impl<'a> Worker<'a> {
         self.recompute_centre();
     }
 
-    /// Runs one batch, calling `visit(offset, x)` for `x(base + (k0 + offset)·P)`
+    /// Runs one batch, calling `visitor.visit(offset, x)` for `x(base + (k0 + offset)·P)`
     /// with `offset` in `-H..=H`, then moves to the next batch (`k0 += 2H+1`).
     /// Returns `false` if the batch was skipped because a visited point or the
     /// centre is the point at infinity (zero difference); `k0` still advances,
     /// so the caller can redo that batch with k256 if it matters.
     #[inline]
-    pub fn batch<F: FnMut(i64, &Fe)>(&mut self, mut visit: F) -> bool {
+    pub fn batch<F: FnMut(i64, &Fe)>(&mut self, visit: F) -> bool {
+        self.batch_with(visit)
+    }
+
+    /// [`Worker::batch`] with a [`Visit`] implementation (see the trait for
+    /// why the hot visitors are not closures).
+    #[inline]
+    pub fn batch_with<V: Visit>(&mut self, mut visitor: V) -> bool {
         if self.degenerate {
             self.skip_batch();
             return false;
@@ -241,16 +296,17 @@ impl<'a> Worker<'a> {
             self.skip_batch();
             return false;
         }
-        visit(0, &cx);
-        let neg_cy = cy.neg();
+        visitor.visit(0, &cx);
         for (j, ((tx, ty), inv)) in xs.iter().zip(ys).zip(&self.inv[..h]).enumerate() {
             let offset = j as i64 + 1;
+            // x(C ± T) = λ² − cx − tx with λ = (±ty − cy) / (tx − cx); only λ²
+            // is needed, so the slope of C − T is taken as (ty + cy) / dx.
+            let sum = cx.add(tx);
             let lambda_plus = ty.sub(&cy).mul(inv);
-            let x_plus = lambda_plus.square().sub(&cx).sub(tx);
-            visit(offset, &x_plus);
-            let lambda_minus = neg_cy.sub(ty).mul(inv);
-            let x_minus = lambda_minus.square().sub(&cx).sub(tx);
-            visit(-offset, &x_minus);
+            let lambda_minus = ty.add(&cy).mul(inv);
+            let x_plus = lambda_plus.square().sub(&sum);
+            let x_minus = lambda_minus.square().sub(&sum);
+            visitor.visit_pair(offset, &x_plus, &x_minus);
         }
         // Jump: C += (2H+1)·G.
         let lambda = table.jump_y.sub(&cy).mul(&self.inv[h]);
@@ -266,24 +322,88 @@ impl<'a> Worker<'a> {
     #[inline]
     pub fn search_batch(&mut self, patterns: &PatternSet, out: &mut Vec<Candidate>) -> bool {
         let k0 = self.k0;
-        self.batch(|offset, x| {
-            let bx = Fe::BETA.mul(x);
-            let b2x = Fe::BETA2.mul(x);
-            let mut hit = |endo: u8, candidate: &Fe| {
-                if let Some(pattern) = patterns.find(candidate) {
-                    out.push(Candidate {
-                        k0,
-                        offset,
-                        endo,
-                        x: *candidate,
-                        pattern,
-                    });
-                }
-            };
-            hit(0, x);
-            hit(1, &bx);
-            hit(2, &b2x);
+        self.batch_with(Searcher {
+            keys: &patterns.keys,
+            patterns,
+            out,
+            k0,
         })
+    }
+}
+
+/// Tests `x`, `β·x` and `β²·x` of every visited point against the patterns.
+struct Searcher<'a> {
+    /// Top-limb (mask, value) of every pattern, in a flat array so the check
+    /// is one load per pattern and nothing is reloaded through `PatternSet`.
+    keys: &'a [(u64, u64)],
+    patterns: &'a PatternSet,
+    out: &'a mut Vec<Candidate>,
+    k0: Scalar,
+}
+
+impl Visit for Searcher<'_> {
+    #[inline(always)]
+    fn visit(&mut self, offset: i64, x: &Fe) {
+        let [bx, b2x] = endomorphisms(x);
+        self.check(offset, x, &bx, &b2x);
+    }
+
+    #[inline(always)]
+    fn visit_pair(&mut self, offset: i64, x_plus: &Fe, x_minus: &Fe) {
+        let [bx_plus, b2x_plus] = endomorphisms(x_plus);
+        let [bx_minus, b2x_minus] = endomorphisms(x_minus);
+        self.check(offset, x_plus, &bx_plus, &b2x_plus);
+        self.check(-offset, x_minus, &bx_minus, &b2x_minus);
+    }
+}
+
+/// `β·x` and `β²·x`. Since β² + β + 1 = 0, β²·x = −(x + β·x): an add and a
+/// negation instead of a second multiplication.
+#[inline(always)]
+fn endomorphisms(x: &Fe) -> [Fe; 2] {
+    let bx = Fe::BETA.mul(x);
+    [bx, bx.add(x).neg()]
+}
+
+impl Searcher<'_> {
+    /// Top-limb test of the three candidates of one point.
+    #[inline(always)]
+    fn check(&mut self, offset: i64, x: &Fe, bx: &Fe, b2x: &Fe) {
+        for (endo, candidate) in [x, bx, b2x].into_iter().enumerate() {
+            let top = candidate.top_limb();
+            if self.keys.iter().any(|&(mask, value)| top & mask == value) {
+                push_candidate(
+                    self.out,
+                    self.patterns,
+                    self.k0,
+                    offset,
+                    endo as u8,
+                    candidate,
+                );
+            }
+        }
+    }
+}
+
+/// Full check of a candidate whose top limb matched some pattern.
+#[cold]
+#[inline(never)]
+fn push_candidate(
+    out: &mut Vec<Candidate>,
+    patterns: &PatternSet,
+    k0: Scalar,
+    offset: i64,
+    endo: u8,
+    x: &Fe,
+) {
+    if let Some(pattern) = patterns.find(x) {
+        out.push(Candidate {
+            k0,
+            offset,
+            endo,
+            x: *x,
+            pattern,
+        });
     }
 }
 
@@ -415,6 +535,21 @@ mod tests {
         with_zero[5] = Fe::ZERO;
         assert!(!batch_invert(&with_zero, &mut scratch, &mut out));
         assert!(batch_invert(&[], &mut [], &mut []));
+        // Lengths around the lane count, and a zero in every lane position.
+        for n in 1..=2 * LANES + 1 {
+            let values = &values[..n];
+            let mut scratch = vec![Fe::ZERO; n];
+            let mut out = vec![Fe::ZERO; n];
+            assert!(batch_invert(values, &mut scratch, &mut out), "n = {n}");
+            for (v, inv) in values.iter().zip(&out) {
+                assert_eq!(v.mul(inv), Fe::ONE, "n = {n}");
+            }
+            for zero_at in 0..n {
+                let mut with_zero = values.to_vec();
+                with_zero[zero_at] = Fe::ZERO;
+                assert!(!batch_invert(&with_zero, &mut scratch, &mut out));
+            }
+        }
     }
 
     #[test]

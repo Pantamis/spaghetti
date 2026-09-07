@@ -16,7 +16,7 @@ use k256::elliptic_curve::Group;
 use k256::{ProjectivePoint, Scalar};
 
 use crate::field::Fe;
-use crate::search::{Table, Worker, affine_xy};
+use crate::search::{Table, Visit, Worker, affine_xy};
 use crate::tweak::{Tweak, lambda_pow};
 
 pub const MIN_BABY_BITS: u32 = 4;
@@ -124,13 +124,23 @@ impl BabyTable {
     }
 
     /// Pushes every `j` with `x(j·G)` sharing the top 64 bits of `x`.
-    #[inline]
     pub fn matches(&self, x: &Fe, out: &mut Vec<u32>) {
         let key = x.top_limb();
-        let bit = key & self.filter_mask;
-        if (self.filter[(bit >> 6) as usize] >> (bit & 63)) & 1 == 0 {
-            return;
+        if self.filter_hit(key) {
+            self.scan_bucket(key, out);
         }
+    }
+
+    /// Bitmap filter on a top limb: `false` means no entry has this key.
+    #[inline(always)]
+    fn filter_hit(&self, key: u64) -> bool {
+        let bit = key & self.filter_mask;
+        (self.filter[(bit >> 6) as usize] >> (bit & 63)) & 1 != 0
+    }
+
+    /// Bucket scan behind the bitmap filter (one lookup in 16 gets here).
+    #[inline(never)]
+    fn scan_bucket(&self, key: u64, out: &mut Vec<u32>) {
         let b = (key >> self.bucket_shift) as usize;
         let (lo, hi) = (self.buckets[b] as usize, self.buckets[b + 1] as usize);
         for (k, j) in self.keys[lo..hi].iter().zip(&self.index[lo..hi]) {
@@ -338,17 +348,37 @@ impl GiantContext<'_> {
         let mut worker = Worker::with_base(table, Scalar::from(k0), *self.q);
         let mut hits: Vec<u64> = Vec::new();
         let mut js: Vec<u32> = Vec::new();
+        let half = table.half as i64;
+        // Top limbs of the batch, indexed by offset + H: the table lookups run
+        // in a separate tight loop so their (random, cache-missing) loads
+        // overlap instead of being serialised behind the field arithmetic.
+        let mut tops = vec![0u64; 2 * table.half + 1];
+        let mut filtered: Vec<(usize, u64)> = Vec::new();
         for _ in 0..batches {
             if stop.load(Ordering::Relaxed) {
                 return None;
             }
-            let visited = worker.batch(|offset, x| {
-                self.baby.matches(x, &mut js);
-                for j in js.drain(..) {
-                    self.check(k0 as i64 + offset, j, &mut hits);
-                }
+            let visited = worker.batch_with(TopCollector {
+                tops: &mut tops,
+                half,
             });
-            if !visited {
+            if visited {
+                // Filter pass first, bucket scans after: each pass is a tight
+                // loop of independent loads, so the cache misses overlap.
+                filtered.clear();
+                filtered.extend(
+                    tops.iter()
+                        .enumerate()
+                        .map(|(idx, &key)| (idx, key))
+                        .filter(|&(_, key)| self.baby.filter_hit(key)),
+                );
+                for &(idx, key) in &filtered {
+                    self.baby.scan_bucket(key, &mut js);
+                    for j in js.drain(..) {
+                        self.check(k0 as i64 + idx as i64 - half, j, &mut hits);
+                    }
+                }
+            } else {
                 slow_batch(table, self.q, k0, |offset, point| {
                     let i = k0 as i64 + offset;
                     if bool::from(point.is_identity()) {
@@ -384,6 +414,19 @@ impl GiantContext<'_> {
                 hits.push(t);
             }
         }
+    }
+}
+
+/// Records the top limb of every visited x, by offset.
+struct TopCollector<'a> {
+    tops: &'a mut [u64],
+    half: i64,
+}
+
+impl Visit for TopCollector<'_> {
+    #[inline(always)]
+    fn visit(&mut self, offset: i64, x: &Fe) {
+        self.tops[(offset + self.half) as usize] = x.top_limb();
     }
 }
 

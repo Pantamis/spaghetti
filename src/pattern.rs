@@ -254,6 +254,8 @@ fn spaced(s: &str) -> String {
 #[derive(Clone, Debug)]
 pub struct PatternSet {
     pub patterns: Vec<Pattern>,
+    /// `(mask_hi, value_hi)` of every pattern: the fast reject of the search loop.
+    pub keys: Vec<(u64, u64)>,
 }
 
 impl PatternSet {
@@ -262,7 +264,8 @@ impl PatternSet {
             .iter()
             .map(|s| Pattern::parse(s, network))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(PatternSet { patterns })
+        let keys = patterns.iter().map(|p| (p.mask_hi, p.value_hi)).collect();
+        Ok(PatternSet { patterns, keys })
     }
 
     /// Index of the first matching pattern for this x coordinate.

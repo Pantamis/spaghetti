@@ -10,7 +10,7 @@ A v0 silent payment address is `bech32m(hrp, q ++ convertbits(ser_P(B_scan) ++ s
 cargo install --git https://github.com/louneskmt/spaghetti
 ```
 
-or clone and `cargo build --release` (binary in `target/release/spaghetti`). For an extra few percent build with `RUSTFLAGS="-C target-cpu=native"`.
+or clone and `cargo build --release` (binary in `target/release/spaghetti`). `RUSTFLAGS="-C target-cpu=native"` made no measurable difference on an Apple M2; it may help on other CPUs.
 
 ## Usage
 
@@ -85,7 +85,7 @@ scan_priv = λ^1·(d + 87960930315849) mod n   → run: spaghetti apply --scan-p
 spaghetti recover --address sp1qqtpasta… -b <D>      # or --xpub <xpub of m/352'/0'/0'/1'>
 ```
 
-For each of the six `(e, s)` variants it solves `s·λ^{-e}·B − D = t·G` for `t < 2^52` with baby-step giant-step: a table of `x(j·G)` for `j < 2^K` (`--baby-bits`, default 22, 60 MB, built in 0.4 s) and up to `2^(52−K)` giant steps per variant, walked with the same batched-inversion machinery as the search. The giant steps run in growing levels over all six variants, so a small `t` is found quickly whatever its variant. Measured on an Apple M2 Pro with 12 threads: about 110 M giant steps/s, i.e. up to 10 s per variant at the default `K`; the example above (`t ≈ 5·2^44`, third variant) took 22 s and the worst case (`t = 2^51 + 12345`, last variant) 53 s. Each extra baby bit halves the giant-step work and doubles the table (`--baby-bits 24`: 240 MB, ~4× faster).
+For each of the six `(e, s)` variants it solves `s·λ^{-e}·B − D = t·G` for `t < 2^52` with baby-step giant-step: a table of `x(j·G)` for `j < 2^K` (`--baby-bits`, default 22, 60 MB, built in 0.4 s) and up to `2^(52−K)` giant steps per variant, walked with the same batched-inversion machinery as the search. The giant steps run in growing levels over all six variants, so a small `t` is found quickly whatever its variant. Measured on an Apple M2 Pro with 12 threads: about 200 M giant steps/s, i.e. up to 5.5 s per variant at the default `K`; the example above (`t ≈ 5·2^44`, third variant) took 12 s and the worst case (`t = 2^51 + 12345`, last variant) 30 s. Each extra baby bit halves the giant-step work and doubles the table (`--baby-bits 24`: 240 MB, ~4× faster).
 
 **Wallet key.** `spaghetti apply --scan-priv <d hex> --tweak <t/e/s> [--address sp1qq…]` prints the vanity scan secret key (`s·λ^e·(d + t) mod n`) and its public key, and checks them against the address if given. Import that secret key as the wallet's scan key; the spend key is unchanged.
 
@@ -114,17 +114,17 @@ From the 7th character on, every character is 5 free bits of x. A bare pattern `
 
 ## Difficulty
 
-Expected candidates = `2^(constrained x bits)` = `32^n` for `n` fixed chars after `sp1qq?`, times 4 if the 6th char is fixed. Measured on an Apple M2 Pro (`--cores 12`): **~330 M x-candidates/s** (≈39 M/s per performance core; each x candidate covers both y parities, see below).
+Expected candidates = `2^(constrained x bits)` = `32^n` for `n` fixed chars after `sp1qq?`, times 4 if the 6th char is fixed. Measured on an Apple M2 Pro (`--cores 12`): **~560 M x-candidates/s** (≈67 M/s per performance core; each x candidate covers both y parities, see below).
 
-| pattern       | fixed chars | expected candidates | expected time at 330 M/s |
+| pattern       | fixed chars | expected candidates | expected time at 560 M/s |
 | ------------- | ----------- | ------------------- | ------------------------ |
-| `pas`         | 3           | 2^15 ≈ 33 K         | 0.1 ms                   |
-| `sp1qqgpas`   | 3 + parity  | 2^17 ≈ 131 K        | 0.4 ms                   |
-| `pasta`       | 5           | 2^25 ≈ 33.6 M       | 0.1 s                    |
-| `lasagna`     | 7           | 2^35 ≈ 34.4 G       | 1.7 min                  |
-| `farfalle`    | 8           | 2^40 ≈ 1.10 T       | 56 min                   |
-| `farfalle7`   | 9           | 2^45 ≈ 35.2 T       | 30 h                     |
-| `pastasauce`  | 10          | 2^50 ≈ 1.13 P       | 40 days                  |
+| `pas`         | 3           | 2^15 ≈ 33 K         | 0.06 ms                  |
+| `sp1qqgpas`   | 3 + parity  | 2^17 ≈ 131 K        | 0.2 ms                   |
+| `pasta`       | 5           | 2^25 ≈ 33.6 M       | 0.06 s                   |
+| `lasagna`     | 7           | 2^35 ≈ 34.4 G       | 1 min                    |
+| `farfalle`    | 8           | 2^40 ≈ 1.10 T       | 33 min                   |
+| `farfalle7`   | 9           | 2^45 ≈ 35.2 T       | 17 h                     |
+| `pastasauce`  | 10          | 2^50 ≈ 1.13 P       | 23 days                  |
 
 The search is memoryless: the ETA in the progress line is `(expected − tested) / rate`, but the true expected remaining time is always `expected / rate` regardless of how long you have already searched.
 
@@ -134,15 +134,15 @@ Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on
 
 1. Random start scalar `k0`, centre point `C = k0·G` (computed once with `k256`).
 2. A shared table holds `j·G` for `j = 1..=H` (`H = 1024`, `--batch` to change) and the jump `(2H+1)·G`.
-3. Per batch, the x coordinates of `C ± j·G` are computed with a single field inversion (Montgomery's trick over `T[j].x − C.x`): 3 multiplications per inverse plus about 2 multiplications and 2 squarings per pair of points. The same inversion batch also produces `C += (2H+1)·G`.
+3. Per batch, the x coordinates of `C ± j·G` are computed with a single field inversion (Montgomery's trick over `T[j].x − C.x`, as four interleaved product chains so consecutive multiplications do not wait on each other): 3 multiplications per inverse plus 2 multiplications and 2 squarings per pair of points. The same inversion batch also produces `C += (2H+1)·G`.
 4. **x-only**: result y coordinates are never computed. Negating the scalar flips the y parity for free, so matching happens on x alone and the parity required by a fixed 6th char is fixed afterwards.
-5. **Endomorphism**: for every x, `β·x` and `β²·x` are also tested (scalars `λk`, `λ²k`). Two multiplications buy two extra candidates.
+5. **Endomorphism**: for every x, `β·x` and `β²·x` are also tested (scalars `λk`, `λ²k`). One multiplication (`β·x`) and one addition (`β²·x = −x − β·x`, since `β² + β + 1 = 0`) buy two extra candidates.
 6. Pattern checks compare the top 64 bits of x as a masked `u64` first and only then fall back to a byte-wise check.
 7. Matches take the slow path: reconstruct the scalar with `k256`, check the derived x, fix the parity, render the address with the `bech32` crate, verify the prefix character by character and decode the address back to the scan key.
 
 Split-key mode reuses the same walk with centre `D + k0·G`; `recover` reuses it with generator `−2^K·G` and centre `s·λ^{-e}·B − D` for the giant steps, so the giant-step rate is the walk rate minus a table lookup (an 8 MB bitmap filter in front of a bucketed sorted array of the top 64 bits of `x`).
 
-Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` (no `unsafe`, no assembly), checked against a big-integer reference in the tests. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
+Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` (no `unsafe`, no assembly), written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
 
 ## Security notes
 
