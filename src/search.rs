@@ -9,10 +9,12 @@
 
 use crate::field::Fe;
 use crate::pattern::PatternSet;
-use k256::elliptic_curve::Generate;
+use crate::tweak::{MAX_TWEAK_BITS, Tweak, lambda_pow};
+use k256::elliptic_curve::Group;
 use k256::elliptic_curve::point::AffineCoordinates;
 use k256::elliptic_curve::scalar::FromUintUnchecked;
 use k256::elliptic_curve::sec1::ToSec1Point;
+use k256::elliptic_curve::{Generate, PrimeField};
 use k256::{NonZeroScalar, ProjectivePoint, Scalar, U256};
 
 const LAMBDA_HEX: &str = "5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72";
@@ -38,9 +40,12 @@ pub fn compressed(point: &ProjectivePoint) -> [u8; 33] {
     out
 }
 
-/// Precomputed `j·G` for `j = 1..=H` plus the batch jump `(2H+1)·G`.
+/// Precomputed `j·P` for `j = 1..=H` plus the batch jump `(2H+1)·P`, for a
+/// generator `P` (`G` for the key search, `−m·G` for the giant steps of
+/// `recover`).
 pub struct Table {
     pub half: usize,
+    pub generator: ProjectivePoint,
     x: Vec<Fe>,
     y: Vec<Fe>,
     jump_x: Fe,
@@ -48,21 +53,22 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn new(half: usize) -> Table {
+    pub fn new(half: usize, generator: ProjectivePoint) -> Table {
         let half = half.max(1);
         let mut x = Vec::with_capacity(half);
         let mut y = Vec::with_capacity(half);
-        let mut point = ProjectivePoint::GENERATOR;
+        let mut point = generator;
         for _ in 0..half {
             let (px, py) = affine_xy(&point);
             x.push(px);
             y.push(py);
-            point += ProjectivePoint::GENERATOR;
+            point += generator;
         }
-        let jump = ProjectivePoint::GENERATOR * Scalar::from(2 * half as u64 + 1);
+        let jump = generator * Scalar::from(2 * half as u64 + 1);
         let (jump_x, jump_y) = affine_xy(&jump);
         Table {
             half,
+            generator,
             x,
             y,
             jump_x,
@@ -121,19 +127,39 @@ pub struct Candidate {
     pub pattern: usize,
 }
 
+/// What a search produces: the scan key itself (random mode) or the public
+/// tweak that turns the base key into it (split-key mode).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Key {
+    Secret([u8; 32]),
+    Tweak(Tweak),
+}
+
 /// A verified vanity scan key.
 #[derive(Clone, Debug)]
 pub struct Found {
-    pub secret: [u8; 32],
+    pub key: Key,
     pub pubkey: [u8; 33],
     pub pattern: usize,
 }
 
+/// How candidate scalars map to points: `k·G` (random start) or
+/// `D + t·G` (split-key mode, `t` small).
+#[derive(Clone, Copy, Debug)]
+pub enum Mode {
+    Random,
+    Split { base: ProjectivePoint },
+}
+
 pub struct Worker<'a> {
     table: &'a Table,
+    /// Point added to every `k·P` of the walk (identity for the key search).
+    base: ProjectivePoint,
     k0: Scalar,
     cx: Fe,
     cy: Fe,
+    /// Centre is the point at infinity: the batch formulas do not apply.
+    degenerate: bool,
     dx: Vec<Fe>,
     scratch: Vec<Fe>,
     inv: Vec<Fe>,
@@ -146,25 +172,56 @@ impl<'a> Worker<'a> {
         Ok(Self::with_start(table, *start.as_ref()))
     }
 
+    /// Worker walking `k·P` from `k0`.
     pub fn with_start(table: &'a Table, k0: Scalar) -> Worker<'a> {
-        let (cx, cy) = affine_xy(&(ProjectivePoint::GENERATOR * k0));
+        Self::with_base(table, k0, ProjectivePoint::IDENTITY)
+    }
+
+    /// Worker walking `base + k·P` from `k0`: the batch at `k0` visits
+    /// `base + (k0 + offset)·P` for `offset ∈ -H..=H`.
+    pub fn with_base(table: &'a Table, k0: Scalar, base: ProjectivePoint) -> Worker<'a> {
         let n = table.half + 1;
-        Worker {
+        let mut worker = Worker {
             table,
+            base,
             k0,
-            cx,
-            cy,
+            cx: Fe::ZERO,
+            cy: Fe::ZERO,
+            degenerate: false,
             dx: vec![Fe::ZERO; n],
             scratch: vec![Fe::ZERO; n],
             inv: vec![Fe::ZERO; n],
-        }
+        };
+        worker.recompute_centre();
+        worker
     }
 
-    /// Runs one batch, calling `visit(offset, x)` for `x((k0 + offset)·G)` with
-    /// `offset` in `-H..=H`, then moves to the next batch. Returns `false` if
-    /// the batch was skipped because of a degenerate (zero) difference.
+    /// Sets the centre to `base + k0·P` with k256.
+    fn recompute_centre(&mut self) {
+        let centre = self.base + self.table.generator * self.k0;
+        self.degenerate = bool::from(centre.is_identity());
+        let (cx, cy) = affine_xy(&centre);
+        self.cx = cx;
+        self.cy = cy;
+    }
+
+    /// Skips the current batch: advances the centre with k256 instead.
+    fn skip_batch(&mut self) {
+        self.k0 = self.k0.add(&Scalar::from(self.table.step()));
+        self.recompute_centre();
+    }
+
+    /// Runs one batch, calling `visit(offset, x)` for `x(base + (k0 + offset)·P)`
+    /// with `offset` in `-H..=H`, then moves to the next batch (`k0 += 2H+1`).
+    /// Returns `false` if the batch was skipped because a visited point or the
+    /// centre is the point at infinity (zero difference); `k0` still advances,
+    /// so the caller can redo that batch with k256 if it matters.
     #[inline]
     pub fn batch<F: FnMut(i64, &Fe)>(&mut self, mut visit: F) -> bool {
+        if self.degenerate {
+            self.skip_batch();
+            return false;
+        }
         let table = self.table;
         let h = table.half;
         let (cx, cy) = (self.cx, self.cy);
@@ -178,12 +235,10 @@ impl<'a> Worker<'a> {
             dx_jump[0] = table.jump_x.sub(&cx);
         }
         if !batch_invert(&self.dx, &mut self.scratch, &mut self.inv) {
-            // C == ±j·G for some j in the table (probability ~2^-247): jump
-            // via k256 instead and skip this batch.
-            self.k0 = self.k0.add(&Scalar::from(table.step()));
-            let (cx, cy) = affine_xy(&(ProjectivePoint::GENERATOR * self.k0));
-            self.cx = cx;
-            self.cy = cy;
+            // C == ±j·P for some j in the table (probability ~2^-247 for a
+            // random start; a real case for the giant steps of `recover`):
+            // jump via k256 instead and skip this batch.
+            self.skip_batch();
             return false;
         }
         visit(0, &cx);
@@ -234,21 +289,37 @@ impl<'a> Worker<'a> {
 
 /// Reconstructs the scalar for a candidate, checks it against k256, and fixes
 /// the y parity when the pattern requires one.
-pub fn resolve(candidate: &Candidate, patterns: &PatternSet) -> Result<Found, String> {
+pub fn resolve(candidate: &Candidate, patterns: &PatternSet, mode: &Mode) -> Result<Found, String> {
     let magnitude = Scalar::from(candidate.offset.unsigned_abs());
-    let mut k = if candidate.offset >= 0 {
+    let k = if candidate.offset >= 0 {
         candidate.k0.add(&magnitude)
     } else {
         candidate.k0.sub(&magnitude)
     };
-    for _ in 0..candidate.endo {
-        k = k.mul(&lambda());
-    }
     let pattern = patterns
         .patterns
         .get(candidate.pattern)
         .ok_or_else(|| "internal: pattern index out of range".to_string())?;
-    let mut point = ProjectivePoint::GENERATOR * k;
+    let (mut point, mut key) = match mode {
+        Mode::Random => {
+            let k = k.mul(&lambda_pow(candidate.endo));
+            (
+                ProjectivePoint::GENERATOR * k,
+                Key::Secret(k.to_bytes().into()),
+            )
+        }
+        Mode::Split { base } => {
+            let t = scalar_to_u64(&k)
+                .filter(|t| *t < 1 << MAX_TWEAK_BITS)
+                .ok_or_else(|| "internal: split-key offset out of range".to_string())?;
+            let tweak = Tweak {
+                t,
+                endo: candidate.endo,
+                negate: false,
+            };
+            (tweak.apply_point(base), Key::Tweak(tweak))
+        }
+    };
     let (x, _) = affine_xy(&point);
     if x != candidate.x {
         return Err("internal: reconstructed key does not reproduce the candidate x".to_string());
@@ -257,18 +328,51 @@ pub fn resolve(candidate: &Candidate, patterns: &PatternSet) -> Result<Found, St
     if let Some(want_odd) = pattern.parity
         && (pubkey[0] == 0x03) != want_odd
     {
-        k = k.negate();
-        point = ProjectivePoint::GENERATOR * k;
+        point = -point;
+        key = match key {
+            Key::Secret(bytes) => {
+                let k = Scalar::from_repr_vartime(bytes.into())
+                    .ok_or_else(|| "internal: secret out of range".to_string())?;
+                Key::Secret(k.negate().to_bytes().into())
+            }
+            Key::Tweak(tweak) => Key::Tweak(Tweak {
+                negate: true,
+                ..tweak
+            }),
+        };
         pubkey = compressed(&point);
     }
     if !pattern.matches_bytes(&pubkey[1..].try_into().map_err(|_| "internal: bad pubkey")?) {
         return Err("internal: pubkey x does not match the pattern".to_string());
     }
     Ok(Found {
-        secret: k.to_bytes().into(),
+        key,
         pubkey,
         pattern: candidate.pattern,
     })
+}
+
+/// The scalar as a `u64` if it fits.
+pub fn scalar_to_u64(k: &Scalar) -> Option<u64> {
+    let bytes: [u8; 32] = k.to_bytes().into();
+    if bytes[..24].iter().any(|&b| b != 0) {
+        return None;
+    }
+    let mut low = [0u8; 8];
+    low.copy_from_slice(&bytes[24..]);
+    Some(u64::from_be_bytes(low))
+}
+
+/// Start offset of split-mode worker `thread`: `thread·2^range_bits + H`, so
+/// its first batch visits `thread·2^range_bits ..= thread·2^range_bits + 2H`.
+pub fn split_start(thread: usize, range_bits: u32, half: usize) -> u64 {
+    ((thread as u64) << range_bits) + half as u64
+}
+
+/// Number of batches a split-mode worker may run before its highest visited
+/// offset (`k0 + H`) would leave its `2^range_bits` range.
+pub fn split_batches(range_bits: u32, half: usize) -> u64 {
+    ((1u64 << range_bits) - 2 * half as u64) / (2 * half as u64 + 1)
 }
 
 #[cfg(test)]
@@ -284,6 +388,17 @@ mod tests {
 
     fn x_of(k: &Scalar) -> Fe {
         affine_xy(&(ProjectivePoint::GENERATOR * k)).0
+    }
+
+    fn g_table(half: usize) -> Table {
+        Table::new(half, ProjectivePoint::GENERATOR)
+    }
+
+    fn secret_of(found: &Found) -> Scalar {
+        match found.key {
+            Key::Secret(bytes) => Scalar::from_repr_vartime(bytes.into()).unwrap(),
+            Key::Tweak(_) => panic!("expected a secret"),
+        }
     }
 
     #[test]
@@ -304,7 +419,7 @@ mod tests {
 
     #[test]
     fn batch_x_coordinates_match_k256() {
-        let table = Table::new(256);
+        let table = g_table(256);
         let k0 = random_scalar();
         let mut worker = Worker::with_start(&table, k0);
         let mut seen = vec![None; 2 * table.half + 1];
@@ -344,6 +459,59 @@ mod tests {
         assert_eq!(count, 2 * table.half + 1);
     }
 
+    /// Generic generator and base: the walk visits `base + (k0 + offset)·P`.
+    #[test]
+    fn batch_with_base_and_generator() {
+        let m = random_scalar();
+        let generator = ProjectivePoint::GENERATOR * m;
+        let table = Table::new(16, generator);
+        let base = ProjectivePoint::GENERATOR * random_scalar();
+        let mut worker = Worker::with_base(&table, Scalar::from(1000u64), base);
+        for batch in 0..3u64 {
+            let k0 = 1000 + batch * table.step();
+            let mut count = 0;
+            assert!(worker.batch(|offset, x| {
+                count += 1;
+                let k = Scalar::from((k0 as i64 + offset) as u64);
+                let expected = affine_xy(&(base + generator * k)).0;
+                assert_eq!(*x, expected, "batch {batch} offset {offset}");
+            }));
+            assert_eq!(count, 2 * table.half + 1);
+        }
+    }
+
+    /// Degenerate centres: the point at infinity and `±j·P` are skipped, the
+    /// walk keeps its position, and the next batch is correct again.
+    #[test]
+    fn degenerate_batches_are_skipped_not_corrupted() {
+        let table = g_table(8);
+        // Centre = H·G: equals the table entry j = H.
+        let mut worker = Worker::with_start(&table, Scalar::from(8u64));
+        assert!(!worker.batch(|_, _| panic!("visited a degenerate batch")));
+        assert_eq!(worker.k0, Scalar::from(8 + 17u64));
+        assert!(worker.batch(|offset, x| {
+            assert_eq!(*x, x_of(&Scalar::from((25 + offset) as u64)));
+        }));
+        // Centre at infinity: base = −k0·G.
+        let base = -(ProjectivePoint::GENERATOR * Scalar::from(100u64));
+        let mut worker = Worker::with_base(&table, Scalar::from(100u64), base);
+        assert!(worker.degenerate);
+        assert!(!worker.batch(|_, _| panic!("visited a degenerate batch")));
+        assert!(!worker.degenerate);
+        // The next centre is the jump point (2H+1)·G itself: skipped too.
+        assert!(!worker.batch(|_, _| panic!("visited a degenerate batch")));
+        assert!(worker.batch(|offset, x| {
+            assert_eq!(*x, x_of(&Scalar::from((34 + offset) as u64)));
+        }));
+        // A visited point at infinity (offset ≠ 0): base = −(k0 + 3)·G.
+        let base = -(ProjectivePoint::GENERATOR * Scalar::from(103u64));
+        let mut worker = Worker::with_base(&table, Scalar::from(100u64), base);
+        assert!(!worker.batch(|_, _| panic!("visited a degenerate batch")));
+        assert!(worker.batch(|offset, x| {
+            assert_eq!(*x, x_of(&Scalar::from((14 + offset) as u64)));
+        }));
+    }
+
     #[test]
     fn endomorphism_scalar_relation() {
         for _ in 0..8 {
@@ -359,17 +527,39 @@ mod tests {
 
     #[test]
     fn small_table_and_step() {
-        let table = Table::new(4);
+        let table = g_table(4);
         assert_eq!(table.step(), 9);
         assert_eq!(table.candidates_per_batch(), 27);
-        assert_eq!(Table::new(0).half, 1);
+        assert_eq!(g_table(0).half, 1);
+    }
+
+    #[test]
+    fn scalar_conversion_and_split_ranges() {
+        assert_eq!(scalar_to_u64(&Scalar::from(u64::MAX)), Some(u64::MAX));
+        assert_eq!(scalar_to_u64(&Scalar::ZERO), Some(0));
+        assert_eq!(
+            scalar_to_u64(&Scalar::from(u64::MAX).add(&Scalar::ONE)),
+            None
+        );
+        assert_eq!(scalar_to_u64(&Scalar::ONE.negate()), None);
+        assert_eq!(split_start(0, 44, 1024), 1024);
+        assert_eq!(split_start(3, 44, 1024), 3 * (1 << 44) + 1024);
+        // The last batch of a worker stays inside its range.
+        for (bits, half) in [(44u32, 1024usize), (20, 64), (12, 8)] {
+            let batches = split_batches(bits, half);
+            let last_k0 = split_start(0, bits, half) + (batches - 1) * (2 * half as u64 + 1);
+            assert!(last_k0 + (half as u64) < (1u64 << bits));
+            assert!(
+                last_k0 + (half as u64) + (2 * half as u64 + 1) >= (1u64 << bits) - 2 * half as u64
+            );
+        }
     }
 
     /// End-to-end: search a short pattern, then independently recompute the
     /// address from the secret key with k256 + bech32 and decode it.
     #[test]
     fn search_and_verify_independently() {
-        let table = Table::new(64);
+        let table = g_table(64);
         let spend = [2u8; 33];
         for (input, network, hrp) in [
             ("sp1qq?q", Network::Mainnet, address::HRP_MAINNET),
@@ -387,10 +577,9 @@ mod tests {
                 assert!(batches < 10_000, "no hit for {input}");
             }
             for candidate in &hits {
-                let found = resolve(candidate, &patterns).unwrap();
+                let found = resolve(candidate, &patterns, &Mode::Random).unwrap();
                 // Independent path: scalar → point → compressed → bech32m.
-                let scalar = Scalar::from_repr_vartime(found.secret.into()).unwrap();
-                let point = ProjectivePoint::GENERATOR * scalar;
+                let point = ProjectivePoint::GENERATOR * secret_of(&found);
                 let pubkey = compressed(&point);
                 assert_eq!(pubkey, found.pubkey);
                 let addr = address::encode(hrp, &pubkey, &spend);
@@ -406,9 +595,61 @@ mod tests {
         }
     }
 
+    /// Split-key mode with two workers on disjoint ranges: every tweak maps the
+    /// base secret to the found key and stays inside its worker's range.
+    #[test]
+    fn split_mode_tweaks_reproduce_keys() {
+        let table = g_table(64);
+        let range_bits = 20;
+        let d = random_scalar();
+        let base = ProjectivePoint::GENERATOR * d;
+        let mode = Mode::Split { base };
+        for input in ["sp1qq?q", "sp1qqgp", "sp1qqvz"] {
+            let patterns = PatternSet::parse(&[input.to_string()], Network::Mainnet).unwrap();
+            let mut workers: Vec<Worker> = (0..2)
+                .map(|i| {
+                    let k0 = Scalar::from(split_start(i, range_bits, table.half));
+                    Worker::with_base(&table, k0, base)
+                })
+                .collect();
+            let mut hits = Vec::new();
+            let mut batches = 0;
+            while hits.is_empty() {
+                for worker in &mut workers {
+                    worker.search_batch(&patterns, &mut hits);
+                }
+                batches += 1;
+                assert!(batches < 10_000, "no hit for {input}");
+            }
+            for candidate in &hits {
+                let found = resolve(candidate, &patterns, &mode).unwrap();
+                let Key::Tweak(tweak) = found.key else {
+                    panic!("expected a tweak");
+                };
+                let range = tweak.t >> range_bits;
+                assert!(range < 2, "{tweak}");
+                let priv_key = tweak.apply(&d);
+                assert_eq!(
+                    compressed(&(ProjectivePoint::GENERATOR * priv_key)),
+                    found.pubkey
+                );
+                assert_eq!(compressed(&tweak.apply_point(&base)), found.pubkey);
+                let pattern = &patterns.patterns[found.pattern];
+                if let Some(odd) = pattern.parity {
+                    assert_eq!(found.pubkey[0] == 0x03, odd);
+                }
+                let addr = address::encode(address::HRP_MAINNET, &found.pubkey, &[2u8; 33]);
+                assert!(pattern.matches_address(&addr), "{input}: {addr}");
+                // Re-parse of the printed form gives the same point.
+                let reparsed: Tweak = tweak.to_string().parse().unwrap();
+                assert_eq!(reparsed, tweak);
+            }
+        }
+    }
+
     #[test]
     fn resolve_rejects_wrong_x() {
-        let table = Table::new(4);
+        let table = g_table(4);
         let patterns = PatternSet::parse(&["sp1qq".to_string()], Network::Mainnet).unwrap();
         let worker = Worker::new(&table).unwrap();
         let candidate = Candidate {
@@ -418,6 +659,18 @@ mod tests {
             x: Fe::ONE,
             pattern: 0,
         };
-        assert!(resolve(&candidate, &patterns).is_err());
+        assert!(resolve(&candidate, &patterns, &Mode::Random).is_err());
+        let base = ProjectivePoint::GENERATOR * random_scalar();
+        assert!(resolve(&candidate, &patterns, &Mode::Split { base }).is_err());
+        // Split mode rejects offsets that do not fit the tweak range.
+        let big = Candidate {
+            k0: Scalar::from(1u64 << 52),
+            offset: 0,
+            endo: 0,
+            x: affine_xy(&(base + ProjectivePoint::GENERATOR * Scalar::from(1u64 << 52))).0,
+            pattern: 0,
+        };
+        let err = resolve(&big, &patterns, &Mode::Split { base }).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
     }
 }
