@@ -39,7 +39,7 @@ fn charset_index(c: u8) -> Option<u8> {
 /// A pattern compiled to a mask over the x coordinate.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Pattern {
-    /// Normalised full text, e.g. `sp1qq?lnm` (lowercase, always full form).
+    /// Normalised full text, e.g. `sp1qq?pas` (lowercase, always full form).
     pub text: String,
     /// Prefix chars after `<hrp>1q` (starting with the constant `q`).
     pub chars: Vec<u8>,
@@ -57,7 +57,7 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    /// Parses either a full pattern (`sp1qq?lnm`) or a bare one (`lnm`).
+    /// Parses either a full pattern (`sp1qq?pas`) or a bare one (`pas`).
     pub fn parse(input: &str, network: Network) -> Result<Pattern, String> {
         let lower = input.trim().to_ascii_lowercase();
         if lower.is_empty() {
@@ -292,27 +292,27 @@ mod tests {
 
     #[test]
     fn bare_form_expands_to_full() {
-        let p = Pattern::parse("lnm", Network::Mainnet).unwrap();
-        assert_eq!(p.text, "sp1qq?lnm");
+        let p = Pattern::parse("pas", Network::Mainnet).unwrap();
+        assert_eq!(p.text, "sp1qq?pas");
         assert_eq!(p.parity, None);
         assert_eq!(p.bits, 15);
-        let t = Pattern::parse("lnm", Network::Testnet).unwrap();
-        assert_eq!(t.text, "tsp1qq?lnm");
-        assert_eq!(Pattern::parse("LNM", Network::Mainnet).unwrap(), p);
+        let t = Pattern::parse("pas", Network::Testnet).unwrap();
+        assert_eq!(t.text, "tsp1qq?pas");
+        assert_eq!(Pattern::parse("PAS", Network::Mainnet).unwrap(), p);
     }
 
     #[test]
     fn full_form_with_parity() {
-        let even = Pattern::parse("sp1qqglnm", Network::Mainnet).unwrap();
+        let even = Pattern::parse("sp1qqgpas", Network::Mainnet).unwrap();
         assert_eq!(even.parity, Some(false));
         assert_eq!(even.bits, 17);
         assert_eq!(even.expected_candidates(), 131072.0);
-        let odd = Pattern::parse("sp1qqvlnm", Network::Mainnet).unwrap();
+        let odd = Pattern::parse("sp1qqvpas", Network::Mainnet).unwrap();
         assert_eq!(odd.parity, Some(true));
-        let wild = Pattern::parse("sp1qq?lnm", Network::Mainnet).unwrap();
-        assert_eq!(wild, Pattern::parse("lnm", Network::Mainnet).unwrap());
-        let t = Pattern::parse("tsp1qqglnm", Network::Testnet).unwrap();
-        assert_eq!(t.text, "tsp1qqglnm");
+        let wild = Pattern::parse("sp1qq?pas", Network::Mainnet).unwrap();
+        assert_eq!(wild, Pattern::parse("pas", Network::Mainnet).unwrap());
+        let t = Pattern::parse("tsp1qqgpas", Network::Testnet).unwrap();
+        assert_eq!(t.text, "tsp1qqgpas");
     }
 
     #[test]
@@ -326,28 +326,28 @@ mod tests {
 
     #[test]
     fn error_fifth_char() {
-        let err = Pattern::parse("sp1qlnm", Network::Mainnet).unwrap_err();
+        let err = Pattern::parse("sp1qpas", Network::Mainnet).unwrap_err();
         assert!(err.contains("sp1qq"), "{err}");
-        assert!(err.contains("try sp1qq?lnm"), "{err}");
+        assert!(err.contains("try sp1qq?pas"), "{err}");
     }
 
     #[test]
     fn error_version_char() {
-        let err = Pattern::parse("sp1plnm", Network::Mainnet).unwrap_err();
+        let err = Pattern::parse("sp1ppas", Network::Mainnet).unwrap_err();
         assert!(err.contains("version"), "{err}");
     }
 
     #[test]
     fn error_sixth_char() {
-        let err = Pattern::parse("sp1qqlnm", Network::Mainnet).unwrap_err();
+        let err = Pattern::parse("sp1qqpas", Network::Mainnet).unwrap_err();
         assert!(err.contains("g f 2 t"), "{err}");
         assert!(err.contains("v d w 0"), "{err}");
-        assert!(err.contains("try sp1qq?lnm"), "{err}");
+        assert!(err.contains("try sp1qq?pas"), "{err}");
     }
 
     #[test]
     fn error_invalid_charset() {
-        let err = Pattern::parse("lnmb", Network::Mainnet).unwrap_err();
+        let err = Pattern::parse("pasb", Network::Mainnet).unwrap_err();
         assert!(err.contains("'b' is not a bech32 character"), "{err}");
         assert!(err.contains("never appear"), "{err}");
         let err = Pattern::parse("ln#", Network::Mainnet).unwrap_err();
@@ -356,11 +356,11 @@ mod tests {
 
     #[test]
     fn error_wrong_hrp() {
-        let err = Pattern::parse("tsp1qq?lnm", Network::Mainnet).unwrap_err();
+        let err = Pattern::parse("tsp1qq?pas", Network::Mainnet).unwrap_err();
         assert!(err.contains("-n testnet"), "{err}");
-        let err = Pattern::parse("sp1qq?lnm", Network::Testnet).unwrap_err();
+        let err = Pattern::parse("sp1qq?pas", Network::Testnet).unwrap_err();
         assert!(err.contains("-n mainnet"), "{err}");
-        let err = Pattern::parse("bc1qq?lnm", Network::Mainnet).unwrap_err();
+        let err = Pattern::parse("bc1qq?pas", Network::Mainnet).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
     }
 
@@ -435,7 +435,7 @@ mod tests {
     #[test]
     fn pattern_set_any_of() {
         let set = PatternSet::parse(
-            &["lnm".to_string(), "sp1qqgacd".to_string()],
+            &["pas".to_string(), "sp1qqgacd".to_string()],
             Network::Mainnet,
         )
         .unwrap();
