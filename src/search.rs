@@ -244,6 +244,20 @@ impl<'a> Worker<'a> {
         worker
     }
 
+    /// Moves the walk to a fresh random start (random mode, after a hit: keys
+    /// from one run must not be related by a small public offset).
+    pub fn reseed(&mut self) -> Result<(), String> {
+        let start = NonZeroScalar::try_generate().map_err(|e| format!("rng failure: {e}"))?;
+        self.restart(*start.as_ref());
+        Ok(())
+    }
+
+    /// Moves the walk to `k0` (split mode: the next offset range).
+    pub fn restart(&mut self, k0: Scalar) {
+        self.k0 = k0;
+        self.recompute_centre();
+    }
+
     /// Sets the centre to `base + k0·P` with k256.
     fn recompute_centre(&mut self) {
         let centre = self.base + self.table.generator * self.k0;
@@ -483,13 +497,13 @@ pub fn scalar_to_u64(k: &Scalar) -> Option<u64> {
     Some(u64::from_be_bytes(low))
 }
 
-/// Start offset of split-mode worker `thread`: `thread·2^range_bits + H`, so
-/// its first batch visits `thread·2^range_bits ..= thread·2^range_bits + 2H`.
-pub fn split_start(thread: usize, range_bits: u32, half: usize) -> u64 {
-    ((thread as u64) << range_bits) + half as u64
+/// Start offset of split-mode range `range`: `range·2^range_bits + H`, so
+/// its first batch visits `range·2^range_bits ..= range·2^range_bits + 2H`.
+pub fn split_start(range: usize, range_bits: u32, half: usize) -> u64 {
+    ((range as u64) << range_bits) + half as u64
 }
 
-/// Number of batches a split-mode worker may run before its highest visited
+/// Number of batches a split-mode walk may run before its highest visited
 /// offset (`k0 + H`) would leave its `2^range_bits` range.
 pub fn split_batches(range_bits: u32, half: usize) -> u64 {
     ((1u64 << range_bits) - 2 * half as u64) / (2 * half as u64 + 1)
@@ -647,6 +661,31 @@ mod tests {
         }));
     }
 
+    /// `restart` moves the walk exactly; `reseed` moves it to an unrelated
+    /// place: the new start is not within ±2^64 of the old one.
+    #[test]
+    fn restart_and_reseed() {
+        let table = g_table(8);
+        let mut worker = Worker::new(&table).unwrap();
+        worker.restart(Scalar::from(1000u64));
+        assert!(worker.batch(|offset, x| {
+            assert_eq!(*x, x_of(&Scalar::from((1000 + offset) as u64)));
+        }));
+        let before = worker.k0;
+        worker.reseed().unwrap();
+        let after = worker.k0;
+        assert!(scalar_to_u64(&after.sub(&before)).is_none());
+        assert!(scalar_to_u64(&before.sub(&after)).is_none());
+        assert!(worker.batch(|offset, x| {
+            let k = if offset >= 0 {
+                after.add(&Scalar::from(offset as u64))
+            } else {
+                after.sub(&Scalar::from(offset.unsigned_abs()))
+            };
+            assert_eq!(*x, x_of(&k));
+        }));
+    }
+
     #[test]
     fn endomorphism_scalar_relation() {
         for _ in 0..8 {
@@ -722,10 +761,10 @@ mod tests {
                     patterns.patterns[found.pattern].matches_address(&addr),
                     "{input}: {addr}"
                 );
-                let (got_hrp, version, payload) = address::decode(&addr).unwrap();
+                let (got_hrp, scan, got_spend) = address::decode(&addr).unwrap();
                 assert_eq!(got_hrp, hrp);
-                assert_eq!(version, bech32::Fe32::Q);
-                assert_eq!(&payload[..33], &pubkey);
+                assert_eq!(scan, pubkey);
+                assert_eq!(got_spend, spend);
             }
         }
     }

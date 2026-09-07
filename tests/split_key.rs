@@ -121,11 +121,21 @@ fn search_apply_recover_roundtrip() {
 
 #[test]
 fn xpub_base_key_and_network_check() {
-    const XPUB: &str = "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5";
+    // BIP32 test vector 1 node m/0H/1/2H: its key and chain code re-serialised
+    // with depth 4 and child 1', the header of an m/352'/coin'/account'/1' node.
+    const XPUB: &str = "xpub6EwK5B8QEa84vLJR7ik6SXv8J5uvxFG5UqdZGqfwQWNqhQfKEd1enZhemimbo7gZw3GJMvfAJsqMYBDsBZHpmBr5j5sECGixfcyhTb4B9jY";
+    // The vector as published (depth 3, child 2') is not a scan account node.
+    const VECTOR_XPUB: &str = "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5";
+    let (ok, _, err) = spaghetti(&["-q", "--xpub", VECTOR_XPUB, "pa"]);
+    assert!(!ok);
+    assert!(
+        err.contains("depth 3") && err.contains("0x80000002"),
+        "{err}"
+    );
     let (ok, out, err) = spaghetti(&["-q", "-c", "1", "--batch", "64", "--xpub", XPUB, "pa"]);
     assert!(ok, "{err}");
     let found = fields(&out);
-    // Base = child 0 of the BIP32 vector-1 node m/0H/1/2H (deterministic).
+    // Base = child 0 of the re-serialised node (deterministic).
     let base = &found["base scan pubkey"];
     assert_eq!(base.len(), 66);
     assert!(base.starts_with("02") || base.starts_with("03"), "{base}");
@@ -154,4 +164,23 @@ fn xpub_base_key_and_network_check() {
     assert!(err.contains("mainnet"), "{err}");
     let (ok, _, err) = spaghetti(&["-b", "02aa", "--xpub", XPUB, "pa"]);
     assert!(!ok, "{err}");
+}
+
+#[test]
+fn cli_limits_and_error_prefixes() {
+    let (ok, _, err) = spaghetti(&["-q", "-c", "1025", "pa"]);
+    assert!(!ok);
+    assert!(err.contains("--cores") && err.contains("1024"), "{err}");
+    let (ok, _, err) = spaghetti(&["-q", "--batch", "0", "pa"]);
+    assert!(!ok);
+    assert!(err.contains("--batch"), "{err}");
+    let (ok, _, err) = spaghetti(&["-q", "--batch", "524289", "pa"]);
+    assert!(!ok);
+    assert!(err.contains("--batch"), "{err}");
+    let (ok, _, err) = spaghetti(&["recover", "--address", "sp1qqnotanaddress", "-b", "02aa"]);
+    assert!(!ok);
+    assert!(err.contains("--address:"), "{err}");
+    let (ok, _, err) = spaghetti(&["-q", "pastá"]);
+    assert!(!ok);
+    assert!(err.contains("'á'"), "{err}");
 }

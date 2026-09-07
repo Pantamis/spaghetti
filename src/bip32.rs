@@ -1,6 +1,7 @@
 //! Minimal BIP32: parse a serialised extended *public* key and derive one
 //! non-hardened child. Enough to turn the xpub of `m/352'/coin'/account'/1'`
-//! into the scan public key at `…/1'/0`.
+//! into the scan public key at `…/1'/0`; [`scan_account_pubkey`] also checks
+//! that the xpub sits at that node (depth 4, child `1'`).
 
 use hmac::{Hmac, KeyInit, Mac};
 use k256::elliptic_curve::Group;
@@ -16,10 +17,17 @@ const VERSION_TPUB: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
 const VERSION_XPRV: [u8; 4] = [0x04, 0x88, 0xAD, 0xE4];
 const VERSION_TPRV: [u8; 4] = [0x04, 0x35, 0x83, 0x94];
 
+/// Depth of `m/352'/coin'/account'/1'`.
+const SCAN_ACCOUNT_DEPTH: u8 = 4;
+/// Child number of the last step, `1'`.
+const SCAN_ACCOUNT_CHILD: u32 = 0x8000_0001;
+
 /// The parts of a serialised extended public key that derivation needs.
 #[derive(Debug)]
 pub struct Xpub {
     pub network: Network,
+    pub depth: u8,
+    pub child: u32,
     pub chain_code: [u8; 32],
     pub key: ProjectivePoint,
 }
@@ -58,6 +66,12 @@ pub fn parse(text: &str) -> Result<Xpub, String> {
             ));
         }
     };
+    let depth = payload[4];
+    let child = u32::from_be_bytes(
+        payload[9..13]
+            .try_into()
+            .map_err(|_| "xpub: internal: child number slice")?,
+    );
     let chain_code: [u8; 32] = payload[13..45]
         .try_into()
         .map_err(|_| "xpub: internal: chain code slice")?;
@@ -66,9 +80,36 @@ pub fn parse(text: &str) -> Result<Xpub, String> {
         .to_projective();
     Ok(Xpub {
         network,
+        depth,
+        child,
         chain_code,
         key,
     })
+}
+
+/// The BIP352 scan public key `…/1'/0` of the account xpub `m/352'/coin'/account'/1'`.
+/// Rejects an xpub at any other depth or child number.
+pub fn scan_account_pubkey(xpub: &str) -> Result<([u8; 33], Network), String> {
+    let parsed = parse(xpub)?;
+    if parsed.depth != SCAN_ACCOUNT_DEPTH || parsed.child != SCAN_ACCOUNT_CHILD {
+        return Err(format!(
+            "xpub: expected the node m/352'/coin'/account'/1' (depth {SCAN_ACCOUNT_DEPTH}, \
+             child 1' = 0x{SCAN_ACCOUNT_CHILD:08x}), got depth {} and child 0x{:08x} ({})",
+            parsed.depth,
+            parsed.child,
+            describe_child(parsed.child)
+        ));
+    }
+    derive_child(xpub, 0)
+}
+
+/// `n` or `n'` for an error message.
+fn describe_child(child: u32) -> String {
+    if child >= 1 << 31 {
+        format!("{}'", child - (1 << 31))
+    } else {
+        child.to_string()
+    }
 }
 
 /// Non-hardened child `index` of `xpub`: `K_i = K + I_L·G` with
@@ -121,10 +162,25 @@ mod tests {
         );
     }
 
+    /// The vector's parent re-serialised with other header fields.
+    pub fn reserialize(xpub: &str, version: Option<[u8; 4]>, depth: u8, child: u32) -> String {
+        let mut raw = bs58::decode(xpub).into_vec().unwrap();
+        if let Some(version) = version {
+            raw[..4].copy_from_slice(&version);
+        }
+        raw[4] = depth;
+        raw[9..13].copy_from_slice(&child.to_be_bytes());
+        let digest = Sha256::digest(Sha256::digest(&raw[..78]));
+        raw[78..].copy_from_slice(&digest[..4]);
+        bs58::encode(&raw).into_string()
+    }
+
     #[test]
     fn parse_fields() {
         let parent = parse(PARENT).unwrap();
         assert_eq!(parent.network, Network::Mainnet);
+        assert_eq!(parent.depth, 3);
+        assert_eq!(parent.child, 0x8000_0002);
         assert_eq!(
             hex::encode(parent.chain_code),
             "04466b9cc8e161e966409ca52986c584f07e9dc81f735db683c3ff6ec7b1503f"
@@ -136,13 +192,29 @@ mod tests {
     }
 
     #[test]
+    fn scan_account_path_check() {
+        let good = reserialize(PARENT, None, SCAN_ACCOUNT_DEPTH, SCAN_ACCOUNT_CHILD);
+        assert_eq!(
+            scan_account_pubkey(&good).unwrap(),
+            derive_child(PARENT, 0).unwrap()
+        );
+        let err = scan_account_pubkey(PARENT).unwrap_err();
+        assert!(err.contains("depth 3"), "{err}");
+        assert!(err.contains("0x80000002 (2')"), "{err}");
+        assert!(err.contains("m/352'/coin'/account'/1'"), "{err}");
+        let wrong_child = reserialize(PARENT, None, SCAN_ACCOUNT_DEPTH, 1);
+        let err = scan_account_pubkey(&wrong_child).unwrap_err();
+        assert!(err.contains("depth 4 and child 0x00000001 (1)"), "{err}");
+        let wrong_depth = reserialize(PARENT, None, 5, SCAN_ACCOUNT_CHILD);
+        assert!(scan_account_pubkey(&wrong_depth).is_err());
+        // derive_child itself stays path-agnostic.
+        assert!(derive_child(&wrong_depth, 0).is_ok());
+    }
+
+    #[test]
     fn tpub_version() {
         // Re-serialise the vector's parent with the tpub version bytes.
-        let mut raw = bs58::decode(PARENT).into_vec().unwrap();
-        raw[..4].copy_from_slice(&VERSION_TPUB);
-        let digest = Sha256::digest(Sha256::digest(&raw[..78]));
-        raw[78..].copy_from_slice(&digest[..4]);
-        let tpub = bs58::encode(&raw).into_string();
+        let tpub = reserialize(PARENT, Some(VERSION_TPUB), 3, 0x8000_0002);
         assert!(tpub.starts_with("tpub"), "{tpub}");
         assert_eq!(parse(&tpub).unwrap().network, Network::Testnet);
         let (child, network) = derive_child(&tpub, 2).unwrap();

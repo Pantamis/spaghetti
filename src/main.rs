@@ -11,7 +11,7 @@ mod tweak;
 
 use std::io::Write;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -22,13 +22,18 @@ use k256::{NonZeroScalar, ProjectivePoint, PublicKey, Scalar};
 
 use pattern::{Network, Pattern, PatternSet};
 use search::{Found, Key, Mode, Table, Worker};
-use tweak::{MAX_SPLIT_THREADS, MAX_TWEAK_BITS, THREAD_RANGE_BITS, Tweak};
+use tweak::{MAX_TWEAK_BITS, RANGE_BITS, SPLIT_RANGES, Tweak};
+
+/// Upper bound on `-c` (OS threads).
+const MAX_THREADS: usize = 1024;
+/// Upper bound on the hidden `--batch` half size `H` (`2H <= 2^20`).
+const MAX_BATCH_HALF: usize = 1 << 19;
 
 #[derive(Clone, Copy, ValueEnum)]
 enum NetworkArg {
     /// hrp `sp`
     Mainnet,
-    /// hrp `tsp` (also used for signet and regtest)
+    /// hrp `tsp` (BIP352: testnet and signet)
     Testnet,
 }
 
@@ -58,11 +63,12 @@ struct Cli {
     #[arg(required = true, value_name = "PATTERN")]
     patterns: Vec<String>,
 
-    /// mainnet | testnet (testnet hrp `tsp` is also used for signet/regtest)
+    /// mainnet (hrp `sp`) | testnet (hrp `tsp`, the BIP352 hrp for testnet and signet;
+    /// regtest has no standard hrp and is not supported)
     #[arg(short, long, value_enum, default_value_t = NetworkArg::Mainnet)]
     network: NetworkArg,
 
-    /// threads [default: available_parallelism]
+    /// OS threads, at most 1024 [default: available_parallelism]
     #[arg(short, long, value_name = "N")]
     cores: Option<usize>,
 
@@ -116,7 +122,7 @@ struct RecoverArgs {
     #[command(flatten)]
     base: BaseKeyArgs,
 
-    /// threads [default: available_parallelism]
+    /// OS threads, at most 1024 [default: available_parallelism]
     #[arg(short, long, value_name = "N")]
     cores: Option<usize>,
 
@@ -196,7 +202,7 @@ fn parse_base_key(args: &BaseKeyArgs, network: Network) -> Result<Option<Project
     match (&args.base_pubkey, &args.xpub) {
         (Some(hex_key), None) => parse_pubkey(hex_key, "--base-pubkey").map(Some),
         (None, Some(xpub)) => {
-            let (key, key_network) = bip32::derive_child(xpub, 0)?;
+            let (key, key_network) = bip32::scan_account_pubkey(xpub)?;
             if key_network != network {
                 return Err(format!(
                     "--xpub is a {} key but the search/address network is {}",
@@ -218,11 +224,25 @@ fn describe(network: Network) -> &'static str {
     }
 }
 
-fn thread_count(cores: Option<usize>) -> usize {
-    match cores {
+fn thread_count(cores: Option<usize>) -> Result<usize, String> {
+    let n = match cores {
         Some(0) | None => thread::available_parallelism().map_or(1, |n| n.get()),
         Some(n) => n,
+    };
+    if n > MAX_THREADS {
+        return Err(format!("--cores: at most {MAX_THREADS} threads, got {n}"));
     }
+    Ok(n)
+}
+
+fn check_batch(half: usize) -> Result<(), String> {
+    if !(1..=MAX_BATCH_HALF).contains(&half) {
+        return Err(format!(
+            "--batch: H must be between 1 and {MAX_BATCH_HALF} (2H points per inversion, at most \
+             2^20), got {half}"
+        ));
+    }
+    Ok(())
 }
 
 fn run(cli: Cli) -> Result<(), String> {
@@ -233,7 +253,8 @@ fn run(cli: Cli) -> Result<(), String> {
         Network::Mainnet => address::HRP_MAINNET,
         Network::Testnet => address::HRP_TESTNET,
     };
-    let cores = thread_count(cli.cores);
+    let cores = thread_count(cli.cores)?;
+    check_batch(cli.batch)?;
     if cli.count == 0 {
         return Err("--count must be at least 1".to_string());
     }
@@ -241,12 +262,12 @@ fn run(cli: Cli) -> Result<(), String> {
         Some(base) => Mode::Split { base },
         None => Mode::Random,
     };
-    if matches!(mode, Mode::Split { .. }) && cores > MAX_SPLIT_THREADS {
-        return Err(format!(
-            "split-key mode supports at most {MAX_SPLIT_THREADS} threads (each thread owns \
-             2^{THREAD_RANGE_BITS} offsets, all offsets must stay below 2^{MAX_TWEAK_BITS})"
-        ));
-    }
+    // Split mode hands out SPLIT_RANGES offset ranges from a queue: more OS
+    // threads than ranges would have nothing to do.
+    let threads = match mode {
+        Mode::Random => cores,
+        Mode::Split { .. } => cores.min(SPLIT_RANGES),
+    };
     let table = Table::new(cli.batch, ProjectivePoint::GENERATOR);
     let expected = patterns.expected_candidates();
     let quiet = cli.quiet;
@@ -254,34 +275,51 @@ fn run(cli: Cli) -> Result<(), String> {
     if !quiet {
         let names: Vec<&str> = patterns.patterns.iter().map(|p| p.text.as_str()).collect();
         eprintln!(
-            "searching {} | difficulty 2^{} ≈ {} candidates | {cores} threads, batch {}{}",
+            "searching {} | difficulty 2^{} ≈ {} candidates | {threads} threads, batch {}{}",
             names.join(" | "),
             patterns.patterns.iter().map(|p| p.bits).min().unwrap_or(0),
             human_count(expected),
             2 * table.half,
             if matches!(mode, Mode::Split { .. }) {
-                " | split-key mode"
+                format!(" | split-key mode ({SPLIT_RANGES} ranges of 2^{RANGE_BITS} offsets)")
             } else {
-                ""
+                String::new()
             }
         );
-        warn_split_coverage(&mode, expected, cores, table.half);
+        warn_split_coverage(&mode, expected, table.half);
     }
 
     let stop = AtomicBool::new(false);
     let tested = AtomicU64::new(0);
+    let ranges = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::channel::<Result<Found, String>>();
     let started = Instant::now();
     let mut found_count = 0u64;
     let mut result = Ok(());
 
     thread::scope(|scope| {
-        for thread in 0..cores {
+        let mut spawn_error = None;
+        for thread in 0..threads {
             let sender = sender.clone();
-            let (table, patterns, stop, tested, mode) = (&table, &patterns, &stop, &tested, &mode);
-            scope.spawn(move || worker_loop(thread, table, patterns, mode, stop, tested, &sender));
+            let (table, patterns, mode) = (&table, &patterns, &mode);
+            let (ranges, stop, tested) = (&ranges, &stop, &tested);
+            let spawned = thread::Builder::new().spawn_scoped(scope, move || {
+                worker_loop(table, patterns, mode, ranges, stop, tested, &sender)
+            });
+            if let Err(e) = spawned {
+                spawn_error = Some(format!(
+                    "could not spawn worker thread {} of {threads}: {e}; lower -c",
+                    thread + 1
+                ));
+                break;
+            }
         }
         drop(sender);
+        if let Some(message) = spawn_error {
+            stop.store(true, Ordering::Relaxed);
+            result = Err(message);
+            return;
+        }
 
         let mut last_progress = Instant::now();
         let mut printed_progress = false;
@@ -314,9 +352,9 @@ fn run(cli: Cli) -> Result<(), String> {
                     result = Err(match mode {
                         Mode::Random => "all workers exited".to_string(),
                         Mode::Split { .. } => format!(
-                            "split-key mode: every thread exhausted its 2^{THREAD_RANGE_BITS} \
-                             offsets without a match; rerun with more threads (-c, up to \
-                             {MAX_SPLIT_THREADS}) or a shorter pattern"
+                            "split-key mode: all {SPLIT_RANGES} ranges of 2^{RANGE_BITS} offsets \
+                             (every offset below 2^{MAX_TWEAK_BITS}) exhausted without a match; \
+                             use a shorter pattern"
                         ),
                     });
                     break;
@@ -336,20 +374,20 @@ fn run(cli: Cli) -> Result<(), String> {
     result
 }
 
-/// Split-key mode covers `cores · 2^44` offsets, i.e. `3·cores·2^44` x
-/// candidates: warn when the pattern is expected to need more than a quarter
-/// of that.
-fn warn_split_coverage(mode: &Mode, expected: f64, cores: usize, half: usize) {
+/// Split-key mode covers all `2^52` offsets, i.e. about `3·2^52` x candidates
+/// whatever the thread count: warn when the pattern is expected to need more
+/// than a quarter of that.
+fn warn_split_coverage(mode: &Mode, expected: f64, half: usize) {
     if !matches!(mode, Mode::Split { .. }) {
         return;
     }
-    let per_thread = search::split_batches(THREAD_RANGE_BITS, half) as f64 * (2 * half + 1) as f64;
-    let coverage = 3.0 * per_thread * cores as f64;
+    let per_range = search::split_batches(RANGE_BITS, half) as f64 * (2 * half + 1) as f64;
+    let coverage = 3.0 * per_range * SPLIT_RANGES as f64;
     if expected * 4.0 > coverage {
         eprintln!(
-            "warning: split-key mode with {cores} threads covers ≈ {} candidates, the pattern \
-             needs ≈ {} on average; a thread that exhausts its range stops, so use more threads \
-             (-c, up to {MAX_SPLIT_THREADS}; they are offset ranges, not cores)",
+            "warning: split-key mode covers at most ≈ {} candidates (every offset below \
+             2^{MAX_TWEAK_BITS}) and the pattern needs ≈ {} on average: the search will likely \
+             exhaust all offsets without a match; use a shorter pattern",
             human_count(coverage),
             human_count(expected)
         );
@@ -357,8 +395,9 @@ fn warn_split_coverage(mode: &Mode, expected: f64, cores: usize, half: usize) {
 }
 
 /// Independent re-check of a match: the rendered address must carry the
-/// requested prefix and decode (bech32m) back to the scan key; in split-key
-/// mode the printed tweak string, re-parsed, must reproduce the scan key.
+/// requested prefix and decode (bech32m) back to the scan key, and the printed
+/// key material, re-parsed from its text form, must reproduce the scan key
+/// (random mode: `G·secret`; split-key mode: the tweak applied to the base key).
 fn final_check(addr: &str, found: &Found, pattern: &Pattern, mode: &Mode) -> Result<(), String> {
     if !pattern.matches_address(addr) {
         return Err(format!(
@@ -366,14 +405,20 @@ fn final_check(addr: &str, found: &Found, pattern: &Pattern, mode: &Mode) -> Res
             pattern.text
         ));
     }
-    let (_, version, payload) = address::decode(addr)?;
-    if version != bech32::Fe32::Q || payload.get(..33) != Some(&found.pubkey[..]) {
+    let (_, scan, _) = address::decode(addr).map_err(|e| format!("internal: {e}"))?;
+    if scan != found.pubkey {
         return Err(format!(
             "internal: address {addr} does not decode to the scan key"
         ));
     }
     match (mode, &found.key) {
-        (Mode::Random, Key::Secret(_)) => Ok(()),
+        (Mode::Random, Key::Secret(secret)) => {
+            let reparsed = parse_secret(&hex::encode(secret), "internal: printed secret key")?;
+            if search::compressed(&(ProjectivePoint::GENERATOR * reparsed)) != found.pubkey {
+                return Err("internal: secret key does not reproduce the scan key".to_string());
+            }
+            Ok(())
+        }
         (Mode::Split { base }, Key::Tweak(tweak)) => {
             let reparsed: Tweak = tweak.to_string().parse()?;
             if search::compressed(&reparsed.apply_point(base)) != found.pubkey {
@@ -387,48 +432,74 @@ fn final_check(addr: &str, found: &Found, pattern: &Pattern, mode: &Mode) -> Res
     }
 }
 
+/// One worker thread. Random mode: walk from a random start; after a hit,
+/// report only that hit and move to a fresh random start, so two keys from
+/// one run are never related by a small public offset (which would let anyone
+/// prove common ownership and turn one secret into the other). Split mode:
+/// take offset ranges `[i·2^44, (i+1)·2^44)` from the shared queue until all
+/// `SPLIT_RANGES` are done; a range starts at `i·2^44 + H` so the first batch
+/// visits `i·2^44 ..= i·2^44 + 2H`, and stops before a batch would cross the
+/// range end.
 fn worker_loop(
-    thread: usize,
     table: &Table,
     patterns: &PatternSet,
     mode: &Mode,
+    ranges: &AtomicUsize,
     stop: &AtomicBool,
     tested: &AtomicU64,
     sender: &mpsc::Sender<Result<Found, String>>,
 ) {
-    let (mut worker, mut budget) = match mode {
-        Mode::Random => match Worker::new(table) {
-            Ok(worker) => (worker, u64::MAX),
-            Err(message) => {
-                let _ = sender.send(Err(message));
+    let mut hits = Vec::new();
+    match mode {
+        Mode::Random => {
+            let mut worker = match Worker::new(table) {
+                Ok(worker) => worker,
+                Err(message) => {
+                    let _ = sender.send(Err(message));
+                    return;
+                }
+            };
+            while !stop.load(Ordering::Relaxed) {
+                if worker.search_batch(patterns, &mut hits) {
+                    tested.fetch_add(table.candidates_per_batch(), Ordering::Relaxed);
+                }
+                if let Some(candidate) = hits.first() {
+                    let resolved = search::resolve(candidate, patterns, mode);
+                    hits.clear();
+                    if sender.send(resolved).is_err() {
+                        return;
+                    }
+                    if let Err(message) = worker.reseed() {
+                        let _ = sender.send(Err(message));
+                        return;
+                    }
+                }
+            }
+        }
+        Mode::Split { base } => loop {
+            let range = ranges.fetch_add(1, Ordering::Relaxed);
+            if range >= SPLIT_RANGES || stop.load(Ordering::Relaxed) {
                 return;
+            }
+            let k0 = search::split_start(range, RANGE_BITS, table.half);
+            let mut worker = Worker::with_base(table, Scalar::from(k0), *base);
+            for _ in 0..search::split_batches(RANGE_BITS, table.half) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                if worker.search_batch(patterns, &mut hits) {
+                    tested.fetch_add(table.candidates_per_batch(), Ordering::Relaxed);
+                }
+                for candidate in hits.drain(..) {
+                    if sender
+                        .send(search::resolve(&candidate, patterns, mode))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
         },
-        Mode::Split { base } => {
-            // Thread i owns offsets [i·2^44, (i+1)·2^44): start at i·2^44 + H so
-            // the first batch visits i·2^44 ..= i·2^44 + 2H, and stop before the
-            // last batch would cross the range end.
-            let k0 = search::split_start(thread, THREAD_RANGE_BITS, table.half);
-            (
-                Worker::with_base(table, Scalar::from(k0), *base),
-                search::split_batches(THREAD_RANGE_BITS, table.half),
-            )
-        }
-    };
-    let mut hits = Vec::new();
-    while !stop.load(Ordering::Relaxed) && budget > 0 {
-        budget -= 1;
-        if worker.search_batch(patterns, &mut hits) {
-            tested.fetch_add(table.candidates_per_batch(), Ordering::Relaxed);
-        }
-        for candidate in hits.drain(..) {
-            if sender
-                .send(search::resolve(&candidate, patterns, mode))
-                .is_err()
-            {
-                return;
-            }
-        }
     }
 }
 
@@ -490,25 +561,19 @@ fn print_match(
     let _ = out.flush();
 }
 
-/// Decodes a v0 silent payment address into its network and scan pubkey.
+/// Decodes a `--address` v0 silent payment address into its network and scan pubkey.
 fn parse_address(text: &str) -> Result<(Network, ProjectivePoint), String> {
-    let (hrp, version, payload) = address::decode(text.trim())?;
+    let (hrp, scan, _) = address::decode(text.trim()).map_err(|e| format!("--address: {e}"))?;
     let network = if hrp == address::HRP_MAINNET {
         Network::Mainnet
     } else if hrp == address::HRP_TESTNET {
         Network::Testnet
     } else {
         return Err(format!(
-            "address hrp '{hrp}' is neither sp (mainnet) nor tsp (testnet)"
+            "--address: hrp '{hrp}' is neither sp (mainnet) nor tsp (testnet/signet)"
         ));
     };
-    if version != bech32::Fe32::Q {
-        return Err("address is not a v0 silent payment address".to_string());
-    }
-    let scan = payload
-        .get(..33)
-        .ok_or_else(|| "address payload is too short".to_string())?;
-    let key = parse_pubkey(&hex::encode(scan), "address scan key")?;
+    let key = parse_pubkey(&hex::encode(scan), "--address: scan key")?;
     Ok((network, key))
 }
 
@@ -517,10 +582,11 @@ fn run_recover(args: RecoverArgs) -> Result<(), String> {
     let base = parse_base_key(&args.base, network)?.ok_or_else(|| {
         "recover needs the base scan pubkey: -b <HEX33> or --xpub <XPUB>".to_string()
     })?;
+    check_batch(args.batch)?;
     let params = recover::Params {
         baby_bits: args.baby_bits,
         max_bits: args.max_bits,
-        threads: thread_count(args.cores),
+        threads: thread_count(args.cores)?,
         half: args.batch,
     };
     if params.max_bits < params.baby_bits || params.max_bits > MAX_TWEAK_BITS {
@@ -590,21 +656,22 @@ fn run_recover(args: RecoverArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn parse_scan_priv(text: &str) -> Result<Scalar, String> {
-    let bytes = hex::decode(text.trim()).map_err(|e| format!("--scan-priv: {e}"))?;
+/// A 32-byte hex secret key as a non-zero scalar; `what` prefixes errors.
+fn parse_secret(text: &str, what: &str) -> Result<Scalar, String> {
+    let bytes = hex::decode(text.trim()).map_err(|e| format!("{what}: {e}"))?;
     let bytes: [u8; 32] = bytes
         .try_into()
-        .map_err(|_| "--scan-priv: expected 32 bytes of hex".to_string())?;
+        .map_err(|_| format!("{what}: expected 32 bytes of hex"))?;
     let scalar = Scalar::from_repr_vartime(bytes.into())
-        .ok_or_else(|| "--scan-priv: value is not below the curve order n".to_string())?;
+        .ok_or_else(|| format!("{what}: value is not below the curve order n"))?;
     if scalar == Scalar::ZERO {
-        return Err("--scan-priv: the zero key is not a valid secret key".to_string());
+        return Err(format!("{what}: the zero key is not a valid secret key"));
     }
     Ok(scalar)
 }
 
 fn run_apply(args: &ApplyArgs) -> Result<(), String> {
-    let d = parse_scan_priv(&args.scan_priv)?;
+    let d = parse_secret(&args.scan_priv, "--scan-priv")?;
     let secret = args.tweak.apply(&d);
     if secret == Scalar::ZERO {
         return Err("the tweak maps this key to zero; it cannot be a valid scan key".to_string());
@@ -703,6 +770,7 @@ fn human_duration(seconds: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bech32::{ByteIterExt, Fe32IterExt};
 
     #[test]
     fn human_formats() {
@@ -731,7 +799,11 @@ mod tests {
         assert!(parse_pubkey(&"02".repeat(32), "x").is_err());
     }
 
-    const XPUB: &str = "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5";
+    /// BIP32 test vector 1 node m/0H/1/2H (depth 3, child 2').
+    const VECTOR_XPUB: &str = "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5";
+    /// The same key and chain code re-serialised with depth 4 and child 1'
+    /// (the header of an `m/352'/coin'/account'/1'` node).
+    const ACCOUNT_XPUB: &str = "xpub6EwK5B8QEa84vLJR7ik6SXv8J5uvxFG5UqdZGqfwQWNqhQfKEd1enZhemimbo7gZw3GJMvfAJsqMYBDsBZHpmBr5j5sECGixfcyhTb4B9jY";
 
     #[test]
     fn base_key_sources() {
@@ -740,16 +812,22 @@ mod tests {
             xpub: None,
         };
         assert!(parse_base_key(&none, Network::Mainnet).unwrap().is_none());
+        let wrong_node = BaseKeyArgs {
+            base_pubkey: None,
+            xpub: Some(VECTOR_XPUB.to_string()),
+        };
+        let err = parse_base_key(&wrong_node, Network::Mainnet).unwrap_err();
+        assert!(err.contains("depth 3"), "{err}");
         let from_xpub = BaseKeyArgs {
             base_pubkey: None,
-            xpub: Some(XPUB.to_string()),
+            xpub: Some(ACCOUNT_XPUB.to_string()),
         };
         let point = parse_base_key(&from_xpub, Network::Mainnet)
             .unwrap()
             .unwrap();
         assert_eq!(
             search::compressed(&point),
-            bip32::derive_child(XPUB, 0).unwrap().0
+            bip32::derive_child(VECTOR_XPUB, 0).unwrap().0
         );
         let err = parse_base_key(&from_xpub, Network::Testnet).unwrap_err();
         assert!(err.contains("mainnet"), "{err}");
@@ -769,26 +847,130 @@ mod tests {
         let (network, scan) = parse_address(VECTOR).unwrap();
         assert_eq!(network, Network::Mainnet);
         assert!(hex::encode(search::compressed(&scan)).starts_with("02"));
-        assert!(parse_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").is_err());
-        assert!(parse_address("sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwx").is_err());
+        let err = parse_address("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4").unwrap_err();
+        assert!(err.starts_with("--address:"), "{err}");
+        let err = parse_address("sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwx").unwrap_err();
+        assert!(err.starts_with("--address:"), "{err}");
+        // A scan-key-only payload (33 bytes) is not an address.
+        let short: String = [2u8; 33]
+            .iter()
+            .copied()
+            .bytes_to_fes()
+            .with_checksum::<bech32::Bech32m>(&address::HRP_MAINNET)
+            .with_witness_version(bech32::Fe32::Q)
+            .chars()
+            .collect();
+        let err = parse_address(&short).unwrap_err();
+        assert!(
+            err.starts_with("--address:") && err.contains("33 bytes"),
+            "{err}"
+        );
     }
 
     #[test]
-    fn scan_priv_parsing() {
-        assert!(parse_scan_priv(&"00".repeat(32)).is_err());
-        assert!(parse_scan_priv(&"ff".repeat(32)).is_err());
-        assert!(parse_scan_priv("01").is_err());
+    fn secret_parsing() {
+        assert!(parse_secret(&"00".repeat(32), "x").is_err());
+        assert!(parse_secret(&"ff".repeat(32), "x").is_err());
+        let err = parse_secret("01", "--scan-priv").unwrap_err();
+        assert!(err.starts_with("--scan-priv:"), "{err}");
         assert_eq!(
-            parse_scan_priv(&format!("{}01", "00".repeat(31))).unwrap(),
+            parse_secret(&format!("{}01", "00".repeat(31)), "x").unwrap(),
             Scalar::ONE
         );
+    }
+
+    #[test]
+    fn thread_and_batch_limits() {
+        assert_eq!(thread_count(Some(MAX_THREADS)).unwrap(), MAX_THREADS);
+        assert!(thread_count(Some(0)).unwrap() >= 1);
+        let err = thread_count(Some(MAX_THREADS + 1)).unwrap_err();
+        assert!(err.contains("1024"), "{err}");
+        assert!(check_batch(1).is_ok());
+        assert!(check_batch(MAX_BATCH_HALF).is_ok());
+        assert!(check_batch(0).unwrap_err().contains("--batch"));
+        assert!(check_batch(MAX_BATCH_HALF + 1).is_err());
+    }
+
+    /// Split mode with every range already taken: the worker exits without
+    /// reporting anything, which is what makes the main loop fail cleanly.
+    #[test]
+    fn split_worker_exits_when_ranges_are_exhausted() {
+        let table = Table::new(4, ProjectivePoint::GENERATOR);
+        let patterns = PatternSet::parse(&["sp1qq".to_string()], Network::Mainnet).unwrap();
+        let mode = Mode::Split {
+            base: ProjectivePoint::GENERATOR,
+        };
+        let ranges = AtomicUsize::new(SPLIT_RANGES);
+        let (sender, receiver) = mpsc::channel();
+        worker_loop(
+            &table,
+            &patterns,
+            &mode,
+            &ranges,
+            &AtomicBool::new(false),
+            &AtomicU64::new(0),
+            &sender,
+        );
+        drop(sender);
+        assert!(receiver.recv().is_err());
+    }
+
+    /// Random mode reseeds after every hit: keys reported by one worker are
+    /// not related by a small offset (in any of the six `±λ^e` variants), so
+    /// an observer cannot link them and one secret does not yield another.
+    #[test]
+    fn random_hits_from_one_worker_are_unlinkable() {
+        let table = Table::new(64, ProjectivePoint::GENERATOR);
+        let patterns = PatternSet::parse(&["sp1qq?q".to_string()], Network::Mainnet).unwrap();
+        let stop = AtomicBool::new(false);
+        let tested = AtomicU64::new(0);
+        let ranges = AtomicUsize::new(0);
+        let (sender, receiver) = mpsc::channel();
+        let mut secrets = Vec::new();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                worker_loop(
+                    &table,
+                    &patterns,
+                    &Mode::Random,
+                    &ranges,
+                    &stop,
+                    &tested,
+                    &sender,
+                )
+            });
+            for _ in 0..4 {
+                let found = receiver.recv().unwrap().unwrap();
+                let Key::Secret(bytes) = found.key else {
+                    panic!("expected a secret");
+                };
+                let secret = Scalar::from_repr_vartime(bytes.into()).unwrap();
+                assert_eq!(
+                    search::compressed(&(ProjectivePoint::GENERATOR * secret)),
+                    found.pubkey
+                );
+                secrets.push(secret);
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+        let far = |d: Scalar| search::scalar_to_u64(&d).is_none_or(|t| t >= 1 << 40);
+        for (i, a) in secrets.iter().enumerate() {
+            for b in &secrets[i + 1..] {
+                for endo in 0..3u8 {
+                    for negate in [false, true] {
+                        let variant = Tweak { t: 0, endo, negate }.apply(a);
+                        assert!(far(b.sub(&variant)) && far(variant.sub(b)), "linked keys");
+                    }
+                }
+            }
+        }
     }
 
     /// `apply` on a search result reproduces the found key, and the final
     /// check accepts exactly that pubkey.
     #[test]
     fn split_final_check_and_apply() {
-        let d = parse_scan_priv(&format!("{}2a", "00".repeat(31))).unwrap();
+        let d = parse_secret(&format!("{}2a", "00".repeat(31)), "x").unwrap();
         let base = ProjectivePoint::GENERATOR * d;
         let tweak: Tweak = "12345/2/-".parse().unwrap();
         let pubkey = search::compressed(&tweak.apply_point(&base));
@@ -811,6 +993,35 @@ mod tests {
             search::compressed(&(ProjectivePoint::GENERATOR * secret)),
             pubkey
         );
+    }
+
+    /// Random mode: the final check re-derives the pubkey from the printed
+    /// secret and rejects a secret that does not produce the address's key.
+    #[test]
+    fn random_final_check_rederives_pubkey() {
+        let k = parse_secret(&format!("{}2a", "00".repeat(31)), "x").unwrap();
+        let pubkey = search::compressed(&(ProjectivePoint::GENERATOR * k));
+        let pattern = Pattern::parse("sp1qq", Network::Mainnet).unwrap();
+        let addr = address::encode(address::HRP_MAINNET, &pubkey, &[2u8; 33]);
+        let found = Found {
+            key: Key::Secret(k.to_bytes().into()),
+            pubkey,
+            pattern: 0,
+        };
+        final_check(&addr, &found, &pattern, &Mode::Random).unwrap();
+        let wrong = Found {
+            key: Key::Secret(k.add(&Scalar::ONE).to_bytes().into()),
+            pubkey,
+            pattern: 0,
+        };
+        let err = final_check(&addr, &wrong, &pattern, &Mode::Random).unwrap_err();
+        assert!(err.contains("secret key"), "{err}");
+        let zero = Found {
+            key: Key::Secret([0u8; 32]),
+            pubkey,
+            pattern: 0,
+        };
+        assert!(final_check(&addr, &zero, &pattern, &Mode::Random).is_err());
     }
 
     #[test]

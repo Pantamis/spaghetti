@@ -20,15 +20,33 @@ pub fn encode(hrp: Hrp, scan: &[u8; 33], spend: &[u8; 33]) -> String {
         .collect()
 }
 
-/// Decodes a bech32m string into `(hrp, version, payload bytes)`.
-/// Used only for the final independent sanity check of a found key.
-pub fn decode(address: &str) -> Result<(Hrp, Fe32, Vec<u8>), String> {
+/// Strictly decodes a v0 silent payment address into `(hrp, scan, spend)`:
+/// bech32m, version `q`, exactly 66 payload bytes and zero padding bits (the
+/// re-encoded keys must reproduce the input).
+pub fn decode(address: &str) -> Result<(Hrp, [u8; 33], [u8; 33]), String> {
     let mut parsed = CheckedHrpstring::new::<Bech32m>(address).map_err(|e| e.to_string())?;
     let version = parsed
         .remove_witness_version()
         .ok_or_else(|| "address has no version character".to_string())?;
+    if version != Fe32::Q {
+        return Err(format!("address version is '{version}', not the v0 'q'"));
+    }
     let payload: Vec<u8> = parsed.fe32_iter().fes_to_bytes().collect();
-    Ok((parsed.hrp(), version, payload))
+    if payload.len() != 66 {
+        return Err(format!(
+            "address payload is {} bytes, expected 66 (two compressed keys)",
+            payload.len()
+        ));
+    }
+    let hrp = parsed.hrp();
+    let mut scan = [0u8; 33];
+    let mut spend = [0u8; 33];
+    scan.copy_from_slice(&payload[..33]);
+    spend.copy_from_slice(&payload[33..]);
+    if encode(hrp, &scan, &spend) != address.to_ascii_lowercase() {
+        return Err("address has non-zero padding bits".to_string());
+    }
+    Ok((hrp, scan, spend))
 }
 
 #[cfg(test)]
@@ -43,6 +61,18 @@ mod tests {
         let scalar = Scalar::from_repr_vartime(bytes.into()).unwrap();
         let point = (ProjectivePoint::GENERATOR * scalar).to_affine();
         point.to_sec1_point(true).as_bytes().try_into().unwrap()
+    }
+
+    /// bech32m string with version `q` over arbitrary payload bytes.
+    fn raw(hrp: Hrp, payload: &[u8]) -> String {
+        payload
+            .iter()
+            .copied()
+            .bytes_to_fes()
+            .with_checksum::<Bech32m>(&hrp)
+            .with_witness_version(Fe32::Q)
+            .chars()
+            .collect()
     }
 
     const VECTOR_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
@@ -62,12 +92,15 @@ mod tests {
     fn decode_roundtrip() {
         let scan = compressed(VECTOR_SCAN);
         let spend = compressed(VECTOR_SPEND);
-        let (hrp, version, payload) = decode(VECTOR_ADDRESS).unwrap();
+        let (hrp, got_scan, got_spend) = decode(VECTOR_ADDRESS).unwrap();
         assert_eq!(hrp, HRP_MAINNET);
-        assert_eq!(version, Fe32::Q);
-        assert_eq!(payload.len(), 66);
-        assert_eq!(&payload[..33], &scan);
-        assert_eq!(&payload[33..], &spend);
+        assert_eq!(got_scan, scan);
+        assert_eq!(got_spend, spend);
+        // Uppercase is valid bech32; mixed case is not.
+        assert!(decode(&VECTOR_ADDRESS.to_uppercase()).is_ok());
+        let mut mixed = VECTOR_ADDRESS.to_string();
+        mixed.replace_range(0..1, "S");
+        assert!(decode(&mixed).is_err());
     }
 
     #[test]
@@ -76,8 +109,48 @@ mod tests {
         let spend = compressed(VECTOR_SPEND);
         let address = encode(HRP_TESTNET, &scan, &spend);
         assert!(address.starts_with("tsp1qq"));
-        let (hrp, _, payload) = decode(&address).unwrap();
+        let (hrp, got_scan, _) = decode(&address).unwrap();
         assert_eq!(hrp, HRP_TESTNET);
-        assert_eq!(&payload[..33], &scan);
+        assert_eq!(got_scan, scan);
+    }
+
+    #[test]
+    fn decode_is_strict() {
+        let err = decode(&raw(HRP_MAINNET, &[2u8; 33])).unwrap_err();
+        assert!(err.contains("33 bytes"), "{err}");
+        let err = decode(&raw(HRP_MAINNET, &[7u8; 70])).unwrap_err();
+        assert!(err.contains("70 bytes"), "{err}");
+        // 66 bytes = 105.6 groups: the last group carries 2 padding bits.
+        let mut fes: Vec<Fe32> = [1u8; 66].iter().copied().bytes_to_fes().collect();
+        assert_eq!(fes.len(), 106);
+        fes[105] = Fe32::try_from(fes[105].to_u8() | 0x03).unwrap();
+        let dirty: String = fes
+            .into_iter()
+            .with_checksum::<Bech32m>(&HRP_MAINNET)
+            .with_witness_version(Fe32::Q)
+            .chars()
+            .collect();
+        let err = decode(&dirty).unwrap_err();
+        assert!(err.contains("padding"), "{err}");
+        // Other witness versions and the bech32 (non-m) checksum are rejected.
+        let v1: String = [1u8; 66]
+            .iter()
+            .copied()
+            .bytes_to_fes()
+            .with_checksum::<Bech32m>(&HRP_MAINNET)
+            .with_witness_version(Fe32::P)
+            .chars()
+            .collect();
+        let err = decode(&v1).unwrap_err();
+        assert!(err.contains("version"), "{err}");
+        let b32: String = [1u8; 66]
+            .iter()
+            .copied()
+            .bytes_to_fes()
+            .with_checksum::<bech32::Bech32>(&HRP_MAINNET)
+            .with_witness_version(Fe32::Q)
+            .chars()
+            .collect();
+        assert!(decode(&b32).is_err());
     }
 }

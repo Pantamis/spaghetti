@@ -78,72 +78,68 @@ impl Pattern {
                      expected a prefix like {full}..."
                 ));
             }
-            let rest = rest.as_bytes();
-            match rest.first() {
+            let mut rest_chars = rest.chars();
+            match rest_chars.next() {
                 None => return Self::compile(network, b"q"),
-                Some(b'q') => {}
-                Some(&c) => {
+                Some('q') => {}
+                Some(c) => {
                     return Err(format!(
                         "all v0 silent payment addresses start with {hrp}1qq (the char after '1' \
-                         is the version, always q), got '{}' — try {full}{}",
-                        c as char,
-                        String::from_utf8_lossy(&rest[1..])
+                         is the version, always q), got '{c}' — try {full}{}",
+                        &rest[c.len_utf8()..]
                     ));
                 }
             }
-            match rest.get(1) {
+            match rest_chars.next() {
                 None => return Self::compile(network, b"q"),
-                Some(b'q') => {}
-                Some(&c) => {
+                Some('q') => {}
+                Some(c) => {
                     return Err(format!(
                         "all v0 silent payment addresses start with {hrp}1qq (the char after \
                          {hrp}1q is always q because a compressed key starts with 0x02/0x03), \
-                         got '{}' — try {full}{}",
-                        c as char,
-                        String::from_utf8_lossy(&rest[1..])
+                         got '{c}' — try {full}{}",
+                        &rest[1..]
                     ));
                 }
             }
-            String::from_utf8_lossy(&rest[2..]).into_owned()
+            rest[2..].to_string()
         } else {
             format!("?{lower}")
         };
         // `tail` = chars from the 6th one on.
-        let tail = tail.as_bytes();
-        if let Some(&c) = tail.first()
-            && c != b'?'
-            && !EVEN_CHARS.as_bytes().contains(&c)
-            && !ODD_CHARS.as_bytes().contains(&c)
+        if let Some(c) = tail.chars().next()
+            && c != '?'
+            && !EVEN_CHARS.contains(c)
+            && !ODD_CHARS.contains(c)
         {
             return Err(format!(
                 "the 6th char of a silent payment address can only be one of {} (even y) or {} \
-                 (odd y), got '{}' — try {full}{}",
+                 (odd y), got '{c}' — try {full}{tail}",
                 spaced(EVEN_CHARS),
                 spaced(ODD_CHARS),
-                c as char,
-                String::from_utf8_lossy(tail)
             ));
         }
-        if tail.len() > MAX_TAIL_CHARS + 1 {
+        let count = tail.chars().count();
+        if count > MAX_TAIL_CHARS + 1 {
             return Err(format!(
                 "pattern too long: at most {MAX_TAIL_CHARS} chars after the 6th one ({} given)",
-                tail.len() - 1
+                count - 1
             ));
         }
-        for &c in tail {
-            if c != b'?' && charset_index(c).is_none() {
-                let note = if b"1bio".contains(&c) {
+        for c in tail.chars() {
+            if c != '?' && !(c.is_ascii() && charset_index(c as u8).is_some()) {
+                let note = if "1bio".contains(c) {
                     " (1, b, i and o never appear in a bech32 address)"
                 } else {
                     ""
                 };
                 return Err(format!(
-                    "'{}' is not a bech32 character{note}; charset: {}",
-                    c as char,
+                    "'{c}' is not a bech32 character{note}; charset: {}",
                     String::from_utf8_lossy(CHARSET)
                 ));
             }
         }
+        let tail = tail.as_bytes();
         let mut chars = Vec::with_capacity(tail.len() + 1);
         chars.push(b'q');
         chars.extend_from_slice(tail);
@@ -355,6 +351,15 @@ mod tests {
         assert!(err.contains("never appear"), "{err}");
         let err = Pattern::parse("ln#", Network::Mainnet).unwrap_err();
         assert!(err.contains("'#' is not a bech32 character"), "{err}");
+        let err = Pattern::parse("pastá", Network::Mainnet).unwrap_err();
+        assert!(err.contains("'á' is not a bech32 character"), "{err}");
+        let err = Pattern::parse("sp1qqépas", Network::Mainnet).unwrap_err();
+        assert!(err.contains("got 'é'"), "{err}");
+        assert!(err.contains("try sp1qq?épas"), "{err}");
+        let err = Pattern::parse("sp1qépas", Network::Mainnet).unwrap_err();
+        assert!(err.contains("got 'é'"), "{err}");
+        let err = Pattern::parse("sp1épas", Network::Mainnet).unwrap_err();
+        assert!(err.contains("got 'é'"), "{err}");
     }
 
     #[test]

@@ -17,7 +17,7 @@ const P: [u64; 4] = [
 
 /// A canonical secp256k1 field element.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Fe(pub [u64; 4]);
+pub struct Fe([u64; 4]);
 
 impl Fe {
     pub const ZERO: Fe = Fe([0, 0, 0, 0]);

@@ -17,7 +17,7 @@ or clone and `cargo build --release` (binary in `target/release/spaghetti`). `RU
 ```
 spaghetti pasta                 # sp1qq?pasta…  (? = any of the 8 allowed 6th chars)
 spaghetti sp1qqgpasta           # fixed 6th char: forces an even-y scan key
-spaghetti -n testnet pasta      # tsp1qq?pasta…
+spaghetti -n testnet pasta      # tsp1qq?pasta… (testnet and signet)
 spaghetti -k 3 pasta penne      # any-of, stop after 3 matches
 spaghetti -s 02…33-byte-hex pasta   # render the example address with a real spend key
 spaghetti -b 02…33-byte-hex pasta   # split-key mode: seed-recoverable key (see below)
@@ -30,8 +30,9 @@ spaghetti apply --scan-priv <d hex> --tweak 48213946821/1/-   # wallet scan key
 spaghetti [OPTIONS] <PATTERN>...
 
   <PATTERN>...  address prefix, full (sp1qq?pasta) or bare (pasta = sp1qq?pasta); ? = any char
-  -n, --network <NETWORK>      mainnet | testnet (hrp tsp, also used for signet/regtest) [default: mainnet]
-  -c, --cores <N>              threads [default: available_parallelism]
+  -n, --network <NETWORK>      mainnet (hrp sp) | testnet (hrp tsp: the BIP352 hrp for testnet and signet;
+                               regtest has no standard hrp and is not supported) [default: mainnet]
+  -c, --cores <N>              OS threads, at most 1024 [default: available_parallelism]
   -k, --count <N>              stop after N matches [default: 1]
   -s, --spend-pubkey <HEX33>   spend public key used to render the example address (random throwaway one if omitted)
   -b, --base-pubkey <HEX33>    split-key mode: search offsets from this compressed scan pubkey D
@@ -64,7 +65,7 @@ B = s · λ^e · (D + t·G)          has the prefix,
 scan_priv = s · λ^e · (d + t)  mod n
 ```
 
-where `e ∈ {0,1,2}` is the endomorphism power the search applied (`λ` is the secp256k1 GLV scalar, `λ³ = 1`) and `s = ±1` fixes the y parity when the 6th char is fixed. The result is printed as a **tweak string** `<t>/<e>/<s>`, e.g. `48213946821/1/-`. Worker `i` walks offsets `t ∈ [i·2^44, (i+1)·2^44)`, so with at most 256 threads (`-c`, threads are offset ranges and may exceed the core count) every published `t` is below `2^52`. That bound is what makes `t` recoverable by brute force (next paragraph); `2^44` per thread covers about 2^45.6 x candidates per thread (three per point), enough for prefixes up to 9 characters on a dozen threads; the search warns when the pattern needs more coverage than the thread count provides.
+where `e ∈ {0,1,2}` is the endomorphism power the search applied (`λ` is the secp256k1 GLV scalar, `λ³ = 1`) and `s = ±1` fixes the y parity when the 6th char is fixed. The result is printed as a **tweak string** `<t>/<e>/<s>`, e.g. `48213946821/1/-`. The offset space `t < 2^52` is cut into 256 ranges of `2^44` offsets; the worker threads (`-c`, OS threads; more than 256 are of no use here) take ranges from a shared queue and move on to the next one when theirs is exhausted, so every published `t` is below `2^52` whatever the thread count. That bound is what makes `t` recoverable by brute force (next paragraph). All ranges together cover about `3·2^52 ≈ 2^53.6` x candidates (three per point), enough for prefixes up to 10 characters; the search warns when the pattern is expected to need more than a quarter of that, and fails cleanly once every range is exhausted.
 
 ```
 spaghetti -b 0201e79b7d70f29abcc2c41665ac88131fe0ea7be269e558f1aac4ab78522bf51f pasta
@@ -77,7 +78,7 @@ address           : sp1qqtpastarfk66755mwfryh5hjrcwrjmfplvf53gv85aherfgl6myesqn6
 scan_priv = λ^1·(d + 87960930315849) mod n   → run: spaghetti apply --scan-priv <d hex> --tweak 87960930315849/1/+
 ```
 
-**What to store.** The tweak string, next to the descriptor. It is public data (it reveals nothing about `d`), plaintext is fine, and it is not even required: only the seed is secret, and the tweak can be recomputed.
+**What to store.** The tweak string, next to the descriptor. It is public data (it reveals nothing about `d`), plaintext is fine, and it is not even required: only the seed is secret, and the tweak can be recomputed. It is not neutral, though: the tweak together with any address of the wallet reveals the standard scan pubkey `D` (`D = s·λ^{-e}·B − t·G`), so publishing the tweak links the vanity wallet to the wallet's standard BIP352 address if that address was ever used.
 
 **Recovery without the tweak.** Given the seed and any address ever published (the first 52 characters of every address of the wallet encode `B`), `spaghetti recover` finds the tweak again:
 
@@ -91,11 +92,11 @@ For each of the six `(e, s)` variants it solves `s·λ^{-e}·B − D = t·G` for
 
 **Labels caveat.** BIP352 label tweaks are `hash(ser_256(b_scan) ‖ ser_32(m))`, so labeled spend keys, and the change label `m = 0`, depend on the scan key. Everything must be derived from the vanity scan key, and the switch has to happen before the first address is issued: addresses (and their labels) handed out under the original `d` are not detectable with the vanity key.
 
-**Obtaining `D`.** Export the extended public key of `m/352'/0'/0'/1'` (`m/352'/1'/0'/1'` for testnet, a `tpub`) and pass it with `--xpub`: `spaghetti` derives child 0 itself (plain BIP32, HMAC-SHA512). Or pass the compressed public key of `m/352'/0'/0'/1'/0` directly with `-b`. Both `recover` and the search accept either form; the network must match (`-n` for the search, the address hrp for `recover`).
+**Obtaining `D`.** Export the extended public key of `m/352'/0'/0'/1'` (`m/352'/1'/0'/1'` for testnet, a `tpub`) and pass it with `--xpub`: `spaghetti` checks that the xpub sits at that node (depth 4, last child `1'`) and derives child 0 itself (plain BIP32, HMAC-SHA512). Or pass the compressed public key of `m/352'/0'/0'/1'/0` directly with `-b`. Both `recover` and the search accept either form; the network must match (`-n` for the search, the address hrp for `recover`).
 
 ## What can be chosen
 
-Every v0 address starts with `sp1qq` (`tsp1qq` on testnet): `sp` is the hrp, `1` the separator, the first `q` is the version, and the second `q` encodes the five zero bits at the top of the SEC1 tag byte (`0x02`/`0x03`).
+Every v0 address starts with `sp1qq` (`tsp1qq` on testnet and signet): `sp` is the hrp, `1` the separator, the first `q` is the version, and the second `q` encodes the five zero bits at the top of the SEC1 tag byte (`0x02`/`0x03`). BIP352 defines only the hrps `sp` (mainnet) and `tsp` (testnets); regtest hrps such as `sprt` are implementation-defined and not supported.
 
 The 6th character encodes the tag's last two bits (`1` + y parity) and the top two bits of the x coordinate, so only 8 values are possible:
 
@@ -132,15 +133,15 @@ The search is memoryless: the ETA in the progress line is `(expected − tested)
 
 Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on the CPU:
 
-1. Random start scalar `k0`, centre point `C = k0·G` (computed once with `k256`).
+1. Random start scalar `k0`, centre point `C = k0·G` (computed with `k256`; a fresh `k0` after every match).
 2. A shared table holds `j·G` for `j = 1..=H` (`H = 1024`, `--batch` to change) and the jump `(2H+1)·G`.
 3. Per batch, the x coordinates of `C ± j·G` are computed with a single field inversion (Montgomery's trick over `T[j].x − C.x`, as four interleaved product chains so consecutive multiplications do not wait on each other): 3 multiplications per inverse plus 2 multiplications and 2 squarings per pair of points. The same inversion batch also produces `C += (2H+1)·G`.
 4. **x-only**: result y coordinates are never computed. Negating the scalar flips the y parity for free, so matching happens on x alone and the parity required by a fixed 6th char is fixed afterwards.
 5. **Endomorphism**: for every x, `β·x` and `β²·x` are also tested (scalars `λk`, `λ²k`). One multiplication (`β·x`) and one addition (`β²·x = −x − β·x`, since `β² + β + 1 = 0`) buy two extra candidates.
 6. Pattern checks compare the top 64 bits of x as a masked `u64` first and only then fall back to a byte-wise check.
-7. Matches take the slow path: reconstruct the scalar with `k256`, check the derived x, fix the parity, render the address with the `bech32` crate, verify the prefix character by character and decode the address back to the scan key.
+7. Matches take the slow path: reconstruct the scalar with `k256`, check the derived x, fix the parity, render the address with the `bech32` crate, verify the prefix character by character, decode the address back to the scan key and re-derive that key from the printed secret (or tweak).
 
-Split-key mode reuses the same walk with centre `D + k0·G`; `recover` reuses it with generator `−2^K·G` and centre `s·λ^{-e}·B − D` for the giant steps, so the giant-step rate is the walk rate minus a table lookup (an 8 MB bitmap filter in front of a bucketed sorted array of the top 64 bits of `x`).
+Split-key mode reuses the same walk with centre `D + k0·G`, taking `2^44`-offset ranges from a shared queue; `recover` reuses it with generator `−2^K·G` and centre `s·λ^{-e}·B − D` for the giant steps, so the giant-step rate is the walk rate minus a table lookup (an 8 MB bitmap filter in front of a bucketed sorted array of the top 64 bits of `x`).
 
 Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` (no `unsafe`, no assembly), written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
 
@@ -149,6 +150,8 @@ Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit impleme
 - The scan key **only reveals incoming payments** (it lets the holder detect outputs, not spend them), but treat it like any wallet secret: whoever has it can link every payment to you.
 - A vanity scan key from the default mode is not BIP32-derived. Wallets normally derive the scan key from the seed (`m/352'/0'/0'/1'/0`), so such a key cannot be recovered from the seed phrase: back it up separately and inject it into the wallet instead of deriving it. Split-key mode (above) avoids this: the key is the derived one plus a public, recomputable tweak.
 - Keys come from the OS RNG (`getrandom` via `k256`); the search walks a public additive sequence from that random start, so every found key is as unpredictable as its start point. The randomly generated spend key printed when `-s` is omitted is a throwaway used only to render an example address.
+- Several keys from one run (`-k N`) are unrelated: after every match the worker moves to a fresh random start. Keys that came from one walk would differ by a small public offset (times `λ^e`, `±1`), which lets anyone prove they belong together (baby-step giant-step on the difference) and turns one leaked secret into the others.
+- Split-key mode is linkable by construction: every vanity key is `D` plus a small public offset, so all vanity addresses made from one base key `D` (across reruns and tweaks) are provably related to each other, and a published tweak reveals `D` itself (see "What to store"). Use it for one vanity key per wallet, and a random-mode key when the addresses must not be linkable.
 
 ## Development
 

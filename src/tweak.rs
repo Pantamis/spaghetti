@@ -1,10 +1,11 @@
 //! Split-key tweak `<t>/<e>/<s>`: the public data that turns a BIP32-derived
 //! scan key `d` into the vanity scan key `s·λ^e·(d + t) mod n`.
 //!
-//! Range arithmetic shared by the search and `recover`: split-mode worker `i`
-//! walks offsets `t ∈ [i·2^THREAD_RANGE_BITS, (i+1)·2^THREAD_RANGE_BITS)`. With
-//! at most `2^(MAX_TWEAK_BITS − THREAD_RANGE_BITS) = 256` workers every visited
-//! `t` is below `2^MAX_TWEAK_BITS`, which is the range `recover` scans.
+//! Range arithmetic shared by the search and `recover`: the split-mode offset
+//! space is cut into `SPLIT_RANGES = 2^(MAX_TWEAK_BITS − RANGE_BITS) = 256`
+//! ranges `[i·2^RANGE_BITS, (i+1)·2^RANGE_BITS)` that worker threads take from
+//! a shared queue, so every visited `t` is below `2^MAX_TWEAK_BITS`, which is
+//! the range `recover` scans.
 
 use std::fmt;
 use std::str::FromStr;
@@ -13,12 +14,12 @@ use k256::{ProjectivePoint, Scalar};
 
 use crate::search::lambda;
 
-/// Offsets covered by one split-mode worker: `2^44`.
-pub const THREAD_RANGE_BITS: u32 = 44;
+/// Offsets covered by one split-mode range: `2^44`.
+pub const RANGE_BITS: u32 = 44;
 /// Upper bound on every published tweak offset: `2^52`.
 pub const MAX_TWEAK_BITS: u32 = 52;
-/// Maximum number of split-mode workers, `2^(52 − 44)`.
-pub const MAX_SPLIT_THREADS: usize = 1 << (MAX_TWEAK_BITS - THREAD_RANGE_BITS);
+/// Number of split-mode ranges, `2^(52 − 44)`.
+pub const SPLIT_RANGES: usize = 1 << (MAX_TWEAK_BITS - RANGE_BITS);
 
 /// `λ^e` for `e ∈ {0, 1, 2}` (`λ³ = 1`, so any `e` is reduced mod 3).
 pub fn lambda_pow(e: u8) -> Scalar {
