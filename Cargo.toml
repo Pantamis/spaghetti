@@ -1,0 +1,31 @@
+[package]
+name = "spaghetti"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+authors = ["Lounès Ksouri"]
+description = "Vanity BIP352 silent payment address generator"
+repository = "https://github.com/louneskmt/spaghetti"
+readme = "README.md"
+keywords = ["bitcoin", "silent-payments", "bip352", "vanity", "secp256k1"]
+categories = ["command-line-utilities", "cryptography::cryptocurrencies"]
+
+[[bin]]
+name = "spaghetti"
+path = "src/main.rs"
+
+[dependencies]
+bech32 = "0.12.0"
+clap = { version = "4.6.6", features = ["derive"] }
+hex = "0.4.3"
+k256 = "0.14.0"
+
+[dev-dependencies]
+num-bigint = "0.5.1"
+num-traits = "0.2.19"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
