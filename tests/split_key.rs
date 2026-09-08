@@ -1,21 +1,71 @@
 //! End-to-end split-key flow through the binary: search from a base key,
 //! `apply` the tweak to the base secret, `recover` the tweak from the address.
+//! Also the secret-handling surface: `--scan-priv-file` and `--output`.
 
 use std::collections::HashMap;
-use std::process::Command;
+use std::io::Write;
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 const D_HEX: &str = "4f3c0a1b5e6d7c8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f708192a3b4c5";
 
 fn spaghetti(args: &[&str]) -> (bool, String, String) {
-    let output = Command::new(env!("CARGO_BIN_EXE_spaghetti"))
+    spaghetti_stdin(args, "")
+}
+
+/// Runs the binary with `input` on stdin.
+fn spaghetti_stdin(args: &[&str], input: &str) -> (bool, String, String) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_spaghetti"))
         .args(args)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .expect("run spaghetti");
+    let mut stdin = child.stdin.take().expect("piped stdin");
+    stdin.write_all(input.as_bytes()).expect("write stdin");
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for spaghetti");
     (
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// A fresh path in the temp dir; the file is removed when the guard drops.
+struct TempPath(PathBuf);
+
+impl TempPath {
+    fn new(tag: &str) -> TempPath {
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        TempPath(std::env::temp_dir().join(format!("spaghetti-{}-{}-{tag}", std::process::id(), n)))
+    }
+
+    fn with_content(tag: &str, content: &str) -> TempPath {
+        let path = TempPath::new(tag);
+        std::fs::write(&path.0, content).expect("write temp file");
+        path
+    }
+
+    fn as_str(&self) -> &str {
+        self.0.to_str().expect("utf-8 temp path")
+    }
+}
+
+impl Drop for TempPath {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `apply` with the secret on stdin.
+fn apply(secret: &str, rest: &[&str]) -> (bool, String, String) {
+    let mut args = vec!["apply", "--scan-priv-file", "-"];
+    args.extend_from_slice(rest);
+    spaghetti_stdin(&args, secret)
 }
 
 /// `label: value` lines of a stdout block.
@@ -31,11 +81,22 @@ fn fields(stdout: &str) -> HashMap<String, String> {
 
 #[test]
 fn search_apply_recover_roundtrip() {
-    // Base pubkey D = d·G via `apply` with the neutral tweak.
-    let (ok, out, err) = spaghetti(&["apply", "--scan-priv", D_HEX, "--tweak", "0/0/+"]);
+    // Base pubkey D = d·G via `apply` with the neutral tweak, secret from a file.
+    let secret_file = TempPath::with_content("d.hex", &format!("  {D_HEX}\n"));
+    let (ok, out, err) = spaghetti(&[
+        "apply",
+        "--scan-priv-file",
+        secret_file.as_str(),
+        "--tweak",
+        "0/0/+",
+    ]);
     assert!(ok, "{err}");
     let base = fields(&out)["vanity scan public key"].clone();
     assert_eq!(base.len(), 66);
+    // The same secret on stdin gives the same key.
+    let (ok, out, err) = apply(D_HEX, &["--tweak", "0/0/+"]);
+    assert!(ok, "{err}");
+    assert_eq!(fields(&out)["vanity scan public key"], base);
 
     // Split-key search; one thread keeps t tiny so the debug-build recover is fast.
     let (ok, out, err) = spaghetti(&["-q", "-c", "1", "--batch", "64", "-b", &base, "sp1qqgq"]);
@@ -50,15 +111,7 @@ fn search_apply_recover_roundtrip() {
     assert!(out.contains(&format!("--tweak {tweak}")), "{out}");
 
     // apply: the tweaked secret gives the vanity pubkey and matches the address.
-    let (ok, out, err) = spaghetti(&[
-        "apply",
-        "--scan-priv",
-        D_HEX,
-        "--tweak",
-        &tweak,
-        "--address",
-        &address,
-    ]);
+    let (ok, out, err) = apply(D_HEX, &["--tweak", &tweak, "--address", &address]);
     assert!(ok, "{err}");
     let applied = fields(&out);
     assert_eq!(applied["vanity scan public key"], pubkey);
@@ -66,15 +119,7 @@ fn search_apply_recover_roundtrip() {
 
     // apply refuses a mismatching address.
     let other = "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv";
-    let (ok, _, err) = spaghetti(&[
-        "apply",
-        "--scan-priv",
-        D_HEX,
-        "--tweak",
-        &tweak,
-        "--address",
-        other,
-    ]);
+    let (ok, _, err) = apply(D_HEX, &["--tweak", &tweak, "--address", other]);
     assert!(!ok);
     assert!(err.contains("not the tweaked key"), "{err}");
 
@@ -93,13 +138,7 @@ fn search_apply_recover_roundtrip() {
     assert!(ok, "{err}");
     let recovered = fields(&out);
     assert_eq!(recovered["vanity scan pubkey"], pubkey);
-    let (ok, out, err) = spaghetti(&[
-        "apply",
-        "--scan-priv",
-        D_HEX,
-        "--tweak",
-        &recovered["tweak"],
-    ]);
+    let (ok, out, err) = apply(D_HEX, &["--tweak", &recovered["tweak"]]);
     assert!(ok, "{err}");
     assert_eq!(fields(&out)["vanity scan public key"], pubkey);
 
@@ -183,4 +222,128 @@ fn cli_limits_and_error_prefixes() {
     let (ok, _, err) = spaghetti(&["-q", "pastá"]);
     assert!(!ok);
     assert!(err.contains("'á'"), "{err}");
+    // The secret never comes from the command line.
+    let (ok, _, err) = spaghetti(&["apply", "--scan-priv", D_HEX, "--tweak", "0/0/+"]);
+    assert!(!ok);
+    assert!(err.contains("--scan-priv"), "{err}");
+}
+
+#[test]
+fn scan_priv_file_errors_are_prefixed() {
+    let missing = TempPath::new("missing");
+    let (ok, _, err) = spaghetti(&[
+        "apply",
+        "--scan-priv-file",
+        missing.as_str(),
+        "--tweak",
+        "0/0/+",
+    ]);
+    assert!(!ok);
+    assert!(err.starts_with("error: --scan-priv-file:"), "{err}");
+    for bad in ["zz", "01", &"00".repeat(32), &"ff".repeat(32)] {
+        let (ok, _, err) = apply(bad, &["--tweak", "0/0/+"]);
+        assert!(!ok, "{bad}");
+        assert!(err.starts_with("error: --scan-priv-file:"), "{err}");
+    }
+}
+
+#[cfg(unix)]
+fn mode(path: &TempPath) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(&path.0)
+        .expect("metadata")
+        .permissions()
+        .mode()
+        & 0o777
+}
+
+/// `--output`: the secret goes to a new 0600 file only, stdout points at it,
+/// an existing file is never overwritten, and split-key mode refuses the flag.
+#[test]
+fn output_file_holds_the_secret() {
+    let out_file = TempPath::new("apply.out");
+    let (ok, out, err) = apply(D_HEX, &["--tweak", "0/0/+", "--output", out_file.as_str()]);
+    assert!(ok, "{err}");
+    let shown = fields(&out);
+    assert_eq!(
+        shown["vanity scan secret key"],
+        format!("written to {}", out_file.as_str())
+    );
+    assert!(!out.contains(D_HEX), "{out}");
+    let written = std::fs::read_to_string(&out_file.0).expect("read output");
+    let saved = fields(&written);
+    assert_eq!(saved["vanity scan secret key"], D_HEX);
+    assert_eq!(
+        saved["vanity scan public key"],
+        shown["vanity scan public key"]
+    );
+    #[cfg(unix)]
+    assert_eq!(mode(&out_file), 0o600);
+    // Never overwritten.
+    let (ok, _, err) = apply(D_HEX, &["--tweak", "0/0/+", "--output", out_file.as_str()]);
+    assert!(!ok);
+    assert!(
+        err.contains("--output:") && err.contains("already exists"),
+        "{err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out_file.0).expect("read output"),
+        written
+    );
+
+    // Random-mode search: two matches appended to one file, no secret on stdout.
+    let search_file = TempPath::new("search.out");
+    let (ok, out, err) = spaghetti(&[
+        "-q",
+        "-c",
+        "1",
+        "--batch",
+        "64",
+        "-k",
+        "2",
+        "--output",
+        search_file.as_str(),
+        "sp1qq?q",
+    ]);
+    assert!(ok, "{err}");
+    let pointer = format!("scan secret key : written to {}", search_file.as_str());
+    assert_eq!(out.matches(&pointer).count(), 2, "{out}");
+    assert_eq!(out.matches("found after").count(), 2, "{out}");
+    let written = std::fs::read_to_string(&search_file.0).expect("read output");
+    let secrets: Vec<&str> = written
+        .lines()
+        .filter_map(|line| line.strip_prefix("scan secret key : "))
+        .collect();
+    assert_eq!(secrets.len(), 2, "{written}");
+    for secret in &secrets {
+        assert_eq!(secret.len(), 64, "{secret}");
+        assert!(!out.contains(secret), "{out}");
+    }
+    let public: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("scan public key : "))
+        .collect();
+    for line in public {
+        assert!(written.contains(line), "{written}");
+    }
+    assert_eq!(written.matches("found after").count(), 2, "{written}");
+    #[cfg(unix)]
+    assert_eq!(mode(&search_file), 0o600);
+
+    // Split-key mode has no secret to write.
+    let split_file = TempPath::new("split.out");
+    let (ok, _, err) = spaghetti(&[
+        "-q",
+        "-b",
+        "0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+        "--output",
+        split_file.as_str(),
+        "sp1qq?q",
+    ]);
+    assert!(!ok);
+    assert!(
+        err.contains("--output: split-key mode prints no secret"),
+        "{err}"
+    );
+    assert!(!split_file.0.exists());
 }

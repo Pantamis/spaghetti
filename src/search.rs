@@ -19,6 +19,7 @@ use k256::elliptic_curve::Group;
 use k256::elliptic_curve::point::AffineCoordinates;
 use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{NonZeroScalar, ProjectivePoint, Scalar};
+use zeroize::Zeroizing;
 
 use crate::field::Fe;
 use crate::pattern::{Pattern, PatternSet};
@@ -178,7 +179,9 @@ pub struct Walk<'a> {
     table: &'a Table,
     /// Added to every point of the walk (identity for the key search).
     base: ProjectivePoint,
-    k0: Scalar,
+    /// Random mode: the secret of every visited point minus a public offset,
+    /// so it is wiped on drop.
+    k0: Zeroizing<Scalar>,
     cx: Fe,
     cy: Fe,
     /// The centre is the point at infinity: the batch formulas do not apply.
@@ -196,7 +199,7 @@ impl<'a> Walk<'a> {
         let mut walk = Walk {
             table,
             base,
-            k0,
+            k0: Zeroizing::new(k0),
             cx: Fe::ZERO,
             cy: Fe::ZERO,
             degenerate: false,
@@ -220,21 +223,21 @@ impl<'a> Walk<'a> {
     /// Moves the walk to a fresh random start (random mode, after a hit: keys
     /// from one run must not be related by a small public offset).
     pub fn reseed(&mut self) -> Result<(), String> {
-        self.k0 = random_scalar()?;
+        *self.k0 = random_scalar()?;
         self.recompute_centre();
         Ok(())
     }
 
     /// Sets the centre to `base + k0·P` with k256.
     fn recompute_centre(&mut self) {
-        let centre = self.base + self.table.generator * self.k0;
+        let centre = self.base + self.table.generator * *self.k0;
         self.degenerate = bool::from(centre.is_identity());
         (self.cx, self.cy) = affine_xy(&centre);
     }
 
     /// Skips the current batch: advances the centre with k256 instead.
     fn skip_batch(&mut self) {
-        self.k0 = self.k0.add(&Scalar::from(self.table.step()));
+        *self.k0 = self.k0.add(&Scalar::from(self.table.step()));
         self.recompute_centre();
     }
 
@@ -286,28 +289,27 @@ impl<'a> Walk<'a> {
         let ny = lambda.mul(&cx.sub(&nx)).sub(&cy);
         self.cx = nx;
         self.cy = ny;
-        self.k0 = self.k0.add(&Scalar::from(table.step()));
+        *self.k0 = self.k0.add(&Scalar::from(table.step()));
         true
     }
 
     /// One batch of pattern matching; pushes hits into `out`.
     #[inline]
     fn search_batch<'p>(&mut self, patterns: &'p PatternSet, out: &mut Vec<Candidate<'p>>) -> bool {
-        let k0 = self.k0;
         self.batch(Searcher {
             keys: &patterns.keys,
             patterns,
             out,
-            k0,
+            k0: self.k0.clone(),
         })
     }
 }
 
-/// A pattern hit before scalar reconstruction.
-#[derive(Clone, Copy, Debug)]
+/// A pattern hit before scalar reconstruction. No `Debug`: `k0` is the
+/// secret minus a public offset in random mode.
 struct Candidate<'p> {
     /// Batch centre scalar.
-    k0: Scalar,
+    k0: Zeroizing<Scalar>,
     /// `k = k0 + offset` before the endomorphism.
     offset: i64,
     /// Power of λ applied (0, 1 or 2).
@@ -324,7 +326,7 @@ struct Searcher<'p, 'o> {
     keys: &'p [(u64, u64)],
     patterns: &'p PatternSet,
     out: &'o mut Vec<Candidate<'p>>,
-    k0: Scalar,
+    k0: Zeroizing<Scalar>,
 }
 
 impl Visit for Searcher<'_, '_> {
@@ -361,7 +363,7 @@ impl<'p> Searcher<'p, '_> {
                 push_candidate(
                     self.out,
                     self.patterns,
-                    self.k0,
+                    &self.k0,
                     offset,
                     endo as u8,
                     candidate,
@@ -377,14 +379,14 @@ impl<'p> Searcher<'p, '_> {
 fn push_candidate<'p>(
     out: &mut Vec<Candidate<'p>>,
     patterns: &'p PatternSet,
-    k0: Scalar,
+    k0: &Scalar,
     offset: i64,
     endo: u8,
     x: &Fe,
 ) {
     if let Some(pattern) = patterns.find(x) {
         out.push(Candidate {
-            k0,
+            k0: Zeroizing::new(*k0),
             offset,
             endo,
             x: *x,
@@ -403,10 +405,9 @@ pub enum Mode {
 
 /// What a search produces: the scan secret key itself (random mode) or the
 /// base key and the public tweak that turns it into the scan key (split-key
-/// mode).
-#[derive(Clone, Copy, Debug)]
+/// mode). No `Debug`: the secret must not reach logs or error text.
 pub enum Key {
-    Secret(Scalar),
+    Secret(Zeroizing<Scalar>),
     Tweak { base: ProjectivePoint, tweak: Tweak },
 }
 
@@ -414,7 +415,7 @@ impl Key {
     /// The key of `−P` given the key of `P`.
     fn negated(self) -> Key {
         match self {
-            Key::Secret(k) => Key::Secret(k.negate()),
+            Key::Secret(k) => Key::Secret(Zeroizing::new(k.negate())),
             Key::Tweak { base, tweak } => Key::Tweak {
                 base,
                 tweak: Tweak {
@@ -426,8 +427,7 @@ impl Key {
     }
 }
 
-/// A verified vanity scan key.
-#[derive(Clone, Debug)]
+/// A verified vanity scan key (no `Debug`: it may carry the secret).
 pub struct Found {
     pub key: Key,
     pub pubkey: [u8; 33],
@@ -445,7 +445,10 @@ fn resolve(candidate: &Candidate, mode: &Mode) -> Result<Found, String> {
     let (point, key) = match mode {
         Mode::Random => {
             let k = k.mul(&lambda_pow(candidate.endo));
-            (ProjectivePoint::GENERATOR * k, Key::Secret(k))
+            (
+                ProjectivePoint::GENERATOR * k,
+                Key::Secret(Zeroizing::new(k)),
+            )
         }
         Mode::Split { base } => {
             let t = scalar_to_u64(&k)
@@ -603,8 +606,8 @@ mod tests {
     }
 
     fn secret_of(found: &Found) -> Scalar {
-        match found.key {
-            Key::Secret(k) => k,
+        match &found.key {
+            Key::Secret(k) => **k,
             Key::Tweak { .. } => panic!("expected a secret"),
         }
     }
@@ -667,7 +670,7 @@ mod tests {
         }
         // After the batch the centre moved by 2H+1.
         let next = k0.add(&Scalar::from(table.step()));
-        assert_eq!(walk.k0, next);
+        assert_eq!(*walk.k0, next);
         assert_eq!(
             affine_xy(&(ProjectivePoint::GENERATOR * next)),
             (walk.cx, walk.cy)
@@ -710,7 +713,7 @@ mod tests {
         // Centre = H·G: equals the table entry j = H.
         let mut walk = g_walk(&table, 8);
         assert!(!walk.batch(|_: i64, _: &Fe| panic!("visited a degenerate batch")));
-        assert_eq!(walk.k0, Scalar::from(8 + 17u64));
+        assert_eq!(*walk.k0, Scalar::from(8 + 17u64));
         assert!(walk.batch(|offset: i64, x: &Fe| {
             assert_eq!(*x, x_of(&Scalar::from((25 + offset) as u64)));
         }));
@@ -743,9 +746,9 @@ mod tests {
         assert!(walk.batch(|offset: i64, x: &Fe| {
             assert_eq!(*x, x_of(&Scalar::from((1000 + offset) as u64)));
         }));
-        let before = walk.k0;
+        let before = *walk.k0;
         walk.reseed().unwrap();
-        let after = walk.k0;
+        let after = *walk.k0;
         assert!(scalar_to_u64(&after.sub(&before)).is_none());
         assert!(scalar_to_u64(&before.sub(&after)).is_none());
         assert!(walk.batch(|offset: i64, x: &Fe| {
@@ -897,7 +900,7 @@ mod tests {
         let patterns = PatternSet::parse(&["sp1qq".to_string()], Network::Mainnet).unwrap();
         let walk = Walk::random(&table).unwrap();
         let candidate = Candidate {
-            k0: walk.k0,
+            k0: walk.k0.clone(),
             offset: 1,
             endo: 0,
             x: Fe::ONE,
@@ -908,13 +911,15 @@ mod tests {
         assert!(resolve(&candidate, &Mode::Split { base }).is_err());
         // Split mode rejects offsets that do not fit the tweak range.
         let big = Candidate {
-            k0: Scalar::from(1u64 << 52),
+            k0: Zeroizing::new(Scalar::from(1u64 << 52)),
             offset: 0,
             endo: 0,
             x: affine_xy(&(base + ProjectivePoint::GENERATOR * Scalar::from(1u64 << 52))).0,
             pattern: &patterns.patterns[0],
         };
-        let err = resolve(&big, &Mode::Split { base }).unwrap_err();
+        let Err(err) = resolve(&big, &Mode::Split { base }) else {
+            panic!("expected an out-of-range error");
+        };
         assert!(err.contains("out of range"), "{err}");
     }
 
@@ -948,7 +953,9 @@ mod tests {
         thread::scope(|scope| {
             scope.spawn(|| worker(&table, &patterns, &Mode::Random, &shared, &sender));
             for _ in 0..4 {
-                let found = receiver.recv().unwrap().unwrap();
+                let Ok(found) = receiver.recv().unwrap() else {
+                    panic!("worker reported an error");
+                };
                 let secret = secret_of(&found);
                 assert_eq!(
                     compressed(&(ProjectivePoint::GENERATOR * secret)),

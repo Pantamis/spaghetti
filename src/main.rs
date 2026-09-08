@@ -12,7 +12,9 @@ mod recover;
 mod search;
 mod tweak;
 
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
@@ -22,6 +24,7 @@ use std::time::{Duration, Instant};
 use clap::{Args, Parser, Subcommand};
 use k256::elliptic_curve::PrimeField;
 use k256::{ProjectivePoint, PublicKey, Scalar};
+use zeroize::Zeroizing;
 
 use address::Network;
 use pattern::PatternSet;
@@ -69,6 +72,11 @@ struct Cli {
 
     #[command(flatten)]
     base: BaseKeyArgs,
+
+    /// write each match, secret included, to this new file (mode 0600, never overwritten)
+    /// and print it without the secret line
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 
     /// no progress output
     #[arg(short, long)]
@@ -128,9 +136,9 @@ struct RecoverArgs {
 
 #[derive(Args)]
 struct ApplyArgs {
-    /// BIP32-derived scan secret key d (m/352'/coin'/account'/1'/0)
-    #[arg(long, value_name = "HEX32")]
-    scan_priv: String,
+    /// file holding the hex BIP32-derived scan secret key d (m/352'/coin'/account'/1'/0); `-` = stdin
+    #[arg(long, value_name = "PATH")]
+    scan_priv_file: PathBuf,
 
     /// tweak string `<t>/<e>/<s>` printed by the search or by `recover`
     #[arg(long, value_name = "t/e/s")]
@@ -139,6 +147,11 @@ struct ApplyArgs {
     /// address to check against the resulting scan pubkey
     #[arg(long, value_name = "SP_ADDRESS")]
     address: Option<String>,
+
+    /// write the result, secret included, to this new file (mode 0600, never overwritten)
+    /// and print it without the secret line
+    #[arg(long, value_name = "PATH")]
+    output: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -167,6 +180,7 @@ struct Search {
     count: u64,
     spend: [u8; 33],
     spend_provided: bool,
+    output: Option<PathBuf>,
     quiet: bool,
 }
 
@@ -193,6 +207,12 @@ impl Search {
             Mode::Random => cores,
             Mode::Split { .. } => cores.min(SPLIT_RANGES),
         };
+        if cli.output.is_some() && matches!(mode, Mode::Split { .. }) {
+            return Err(
+                "--output: split-key mode prints no secret (the tweak is public); nothing to write"
+                    .to_string(),
+            );
+        }
         Ok(Search {
             patterns,
             network,
@@ -202,6 +222,7 @@ impl Search {
             count: cli.count,
             spend: compressed(&spend),
             spend_provided: cli.spend_pubkey.is_some(),
+            output: cli.output,
             quiet: cli.quiet,
         })
     }
@@ -251,6 +272,10 @@ impl Search {
 
     /// Spawns the workers and prints matches until `count` of them are in.
     fn run(&self) -> Result<(), String> {
+        let mut output = match &self.output {
+            Some(path) => Some((path.as_path(), create_secret_file(path)?)),
+            None => None,
+        };
         if !self.quiet {
             self.announce();
         }
@@ -277,7 +302,7 @@ impl Search {
             }
             drop(sender);
             if result.is_ok() {
-                result = self.collect(&receiver, &shared, started);
+                result = self.collect(&receiver, &shared, started, &mut output);
             }
             shared.stop.store(true, Ordering::Relaxed);
         });
@@ -290,6 +315,7 @@ impl Search {
         receiver: &mpsc::Receiver<Result<Found, String>>,
         shared: &Shared,
         started: Instant,
+        output: &mut Option<(&Path, File)>,
     ) -> Result<(), String> {
         let mut status = StatusLine::default();
         let mut last_progress = Instant::now();
@@ -304,14 +330,27 @@ impl Search {
                     if let Err(message) = final_check(&addr, &found, &self.patterns) {
                         break Err(message);
                     }
-                    print_match(
-                        &found,
-                        &self.spend,
-                        self.spend_provided,
-                        &addr,
+                    let matched = Match {
+                        found: &found,
+                        spend: &self.spend,
+                        spend_provided: self.spend_provided,
+                        addr: &addr,
                         tested,
                         elapsed,
-                    );
+                    };
+                    let mut out = io::stdout().lock();
+                    match output {
+                        Some((path, file)) => {
+                            matched
+                                .write(file, SecretLine::Show)
+                                .and_then(|()| file.flush())
+                                .map_err(|e| format!("--output: {}: {e}", path.display()))?;
+                            let _ = matched.write(&mut out, SecretLine::WrittenTo(path));
+                        }
+                        None => {
+                            let _ = matched.write(&mut out, SecretLine::Show);
+                        }
+                    }
                     found_count += 1;
                     if found_count >= self.count {
                         break Ok(());
@@ -362,13 +401,10 @@ fn final_check(addr: &str, found: &Found, patterns: &PatternSet) -> Result<(), S
     }
     let (what, reproduced) = match &found.key {
         Key::Secret(secret) => {
-            let secret = parse_secret(
-                &hex::encode(secret.to_bytes()),
-                "internal: printed secret key",
-            )?;
+            let secret = parse_secret(&secret_hex(secret), "internal: printed secret key")?;
             (
                 "secret key".to_string(),
-                ProjectivePoint::GENERATOR * secret,
+                ProjectivePoint::GENERATOR * *secret,
             )
         }
         Key::Tweak { base, tweak } => {
@@ -385,54 +421,102 @@ fn final_check(addr: &str, found: &Found, patterns: &PatternSet) -> Result<(), S
     Ok(())
 }
 
-fn print_match(
-    found: &Found,
-    spend: &[u8; 33],
-    spend_provided: bool,
-    addr: &str,
-    tested: u64,
-    elapsed: Duration,
-) {
-    let spend_note = if spend_provided {
-        "(provided)"
-    } else {
-        "(example, random)"
-    };
-    let rate = tested as f64 / elapsed.as_secs_f64().max(1e-9);
-    let mut out = std::io::stdout().lock();
-    match &found.key {
-        Key::Tweak { base, tweak } => {
-            let _ = writeln!(out, "base scan pubkey  : {}", hex::encode(compressed(base)));
-            let _ = writeln!(out, "tweak             : {tweak}");
-            let _ = writeln!(out, "vanity scan pubkey: {}", hex::encode(found.pubkey));
-            let _ = writeln!(
-                out,
-                "spend public key  : {} {spend_note}",
-                hex::encode(spend)
-            );
-            let _ = writeln!(out, "address           : {addr}");
-            let _ = writeln!(
-                out,
-                "scan_priv = {}   → run: spaghetti apply --scan-priv <d hex> --tweak {tweak}",
-                tweak.formula()
-            );
-        }
-        Key::Secret(secret) => {
-            let _ = writeln!(out, "scan secret key : {}", hex::encode(secret.to_bytes()));
-            let _ = writeln!(out, "scan public key : {}", hex::encode(found.pubkey));
-            let _ = writeln!(out, "spend public key: {} {spend_note}", hex::encode(spend));
-            let _ = writeln!(out, "address         : {addr}");
+/// Where the secret line of a match goes.
+enum SecretLine<'a> {
+    /// Printed in place.
+    Show,
+    /// Replaced by a pointer to the `--output` file that holds it.
+    WrittenTo(&'a Path),
+}
+
+impl SecretLine<'_> {
+    /// The text after the label: the hex secret, or where it went.
+    fn render(&self, secret: &Scalar) -> Zeroizing<String> {
+        match self {
+            SecretLine::Show => secret_hex(secret),
+            SecretLine::WrittenTo(path) => Zeroizing::new(format!("written to {}", path.display())),
         }
     }
-    let _ = writeln!(
-        out,
-        "found after {} candidates in {} ({}/s)",
-        human_count(tested as f64),
-        human_duration(elapsed.as_secs_f64()),
-        human_count(rate)
-    );
-    let _ = writeln!(out);
-    let _ = out.flush();
+}
+
+/// Hex of a secret scalar, wiped on drop.
+fn secret_hex(secret: &Scalar) -> Zeroizing<String> {
+    let bytes = Zeroizing::new(secret.to_bytes());
+    Zeroizing::new(hex::encode(bytes.as_slice()))
+}
+
+/// A verified match and the run statistics printed with it.
+struct Match<'a> {
+    found: &'a Found,
+    spend: &'a [u8; 33],
+    spend_provided: bool,
+    addr: &'a str,
+    tested: u64,
+    elapsed: Duration,
+}
+
+impl Match<'_> {
+    /// The match block: key lines, address, then the run statistics.
+    fn write(&self, out: &mut dyn Write, secret: SecretLine) -> io::Result<()> {
+        let spend_note = if self.spend_provided {
+            "(provided)"
+        } else {
+            "(example, random)"
+        };
+        let spend = hex::encode(self.spend);
+        match &self.found.key {
+            Key::Tweak { base, tweak } => {
+                writeln!(out, "base scan pubkey  : {}", hex::encode(compressed(base)))?;
+                writeln!(out, "tweak             : {tweak}")?;
+                writeln!(
+                    out,
+                    "vanity scan pubkey: {}",
+                    hex::encode(self.found.pubkey)
+                )?;
+                writeln!(out, "spend public key  : {spend} {spend_note}")?;
+                writeln!(out, "address           : {}", self.addr)?;
+                writeln!(
+                    out,
+                    "scan_priv = {}   → run: spaghetti apply --scan-priv-file <d hex file> --tweak {tweak}",
+                    tweak.formula()
+                )?;
+            }
+            Key::Secret(key) => {
+                writeln!(out, "scan secret key : {}", *secret.render(key))?;
+                writeln!(out, "scan public key : {}", hex::encode(self.found.pubkey))?;
+                writeln!(out, "spend public key: {spend} {spend_note}")?;
+                writeln!(out, "address         : {}", self.addr)?;
+            }
+        }
+        let rate = self.tested as f64 / self.elapsed.as_secs_f64().max(1e-9);
+        writeln!(
+            out,
+            "found after {} candidates in {} ({}/s)",
+            human_count(self.tested as f64),
+            human_duration(self.elapsed.as_secs_f64()),
+            human_count(rate)
+        )?;
+        writeln!(out)?;
+        out.flush()
+    }
+}
+
+/// Creates the `--output` file: new (never overwritten), owner read/write only.
+fn create_secret_file(path: &Path) -> Result<File, String> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path).map_err(|e| match e.kind() {
+        io::ErrorKind::AlreadyExists => format!(
+            "--output: {} already exists; refusing to overwrite it",
+            path.display()
+        ),
+        _ => format!("--output: {}: {e}", path.display()),
+    })
 }
 
 fn run_recover(args: &RecoverArgs) -> Result<(), String> {
@@ -495,7 +579,7 @@ fn run_recover(args: &RecoverArgs) -> Result<(), String> {
     let _ = writeln!(out, "vanity scan pubkey: {}", hex::encode(pubkey));
     let _ = writeln!(
         out,
-        "scan_priv = {}   → run: spaghetti apply --scan-priv <d hex> --tweak {tweak}",
+        "scan_priv = {}   → run: spaghetti apply --scan-priv-file <d hex file> --tweak {tweak}",
         tweak.formula()
     );
     let _ = writeln!(
@@ -508,12 +592,12 @@ fn run_recover(args: &RecoverArgs) -> Result<(), String> {
 }
 
 fn run_apply(args: &ApplyArgs) -> Result<(), String> {
-    let d = parse_secret(&args.scan_priv, "--scan-priv")?;
-    let secret = args.tweak.apply(&d);
-    if secret == Scalar::ZERO {
+    let d = read_secret_file(&args.scan_priv_file)?;
+    let secret = Zeroizing::new(args.tweak.apply(&d));
+    if *secret == Scalar::ZERO {
         return Err("the tweak maps this key to zero; it cannot be a valid scan key".to_string());
     }
-    let pubkey = compressed(&(ProjectivePoint::GENERATOR * secret));
+    let pubkey = compressed(&(ProjectivePoint::GENERATOR * *secret));
     if let Some(addr) = &args.address {
         let (_, scan) = parse_address(addr)?;
         if compressed(&scan) != pubkey {
@@ -524,22 +608,51 @@ fn run_apply(args: &ApplyArgs) -> Result<(), String> {
             ));
         }
     }
-    let mut out = std::io::stdout().lock();
-    let _ = writeln!(
-        out,
-        "vanity scan secret key: {}",
-        hex::encode(secret.to_bytes())
-    );
-    let _ = writeln!(out, "vanity scan public key: {}", hex::encode(pubkey));
-    if let Some(addr) = &args.address {
-        let _ = writeln!(
+    let write = |out: &mut dyn Write, secret_line: SecretLine| -> io::Result<()> {
+        writeln!(
             out,
-            "address               : {} (scan key matches)",
-            addr.trim()
-        );
+            "vanity scan secret key: {}",
+            *secret_line.render(&secret)
+        )?;
+        writeln!(out, "vanity scan public key: {}", hex::encode(pubkey))?;
+        if let Some(addr) = &args.address {
+            writeln!(
+                out,
+                "address               : {} (scan key matches)",
+                addr.trim()
+            )?;
+        }
+        out.flush()
+    };
+    let mut out = io::stdout().lock();
+    match &args.output {
+        Some(path) => {
+            let mut file = create_secret_file(path)?;
+            write(&mut file, SecretLine::Show)
+                .map_err(|e| format!("--output: {}: {e}", path.display()))?;
+            let _ = write(&mut out, SecretLine::WrittenTo(path));
+        }
+        None => {
+            let _ = write(&mut out, SecretLine::Show);
+        }
     }
-    let _ = out.flush();
     Ok(())
+}
+
+/// The hex secret key in `--scan-priv-file` (`-` = stdin), trimmed.
+fn read_secret_file(path: &Path) -> Result<Zeroizing<Scalar>, String> {
+    let what = "--scan-priv-file";
+    // One allocation for a 64-char hex line plus whitespace: no reallocation
+    // leaves an unwiped copy behind.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(256));
+    let read = if path == Path::new("-") {
+        io::stdin().lock().read_to_end(&mut bytes)
+    } else {
+        File::open(path).and_then(|mut file| file.read_to_end(&mut bytes))
+    };
+    read.map_err(|e| format!("{what}: {}: {e}", path.display()))?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| format!("{what}: not UTF-8 text"))?;
+    parse_secret(text, what)
 }
 
 // ---- argument parsing -------------------------------------------------------
@@ -596,14 +709,18 @@ fn parse_address(text: &str) -> Result<(Network, ProjectivePoint), String> {
 }
 
 /// A 32-byte hex secret key as a non-zero scalar; `what` prefixes errors.
-fn parse_secret(text: &str, what: &str) -> Result<Scalar, String> {
-    let bytes = hex::decode(text.trim()).map_err(|e| format!("{what}: {e}"))?;
-    let bytes: [u8; 32] = bytes
+/// Every intermediate copy of the key is wiped on drop.
+fn parse_secret(text: &str, what: &str) -> Result<Zeroizing<Scalar>, String> {
+    let bytes = Zeroizing::new(hex::decode(text.trim()).map_err(|e| format!("{what}: {e}"))?);
+    let bytes: Zeroizing<[u8; 32]> = bytes
+        .as_slice()
         .try_into()
+        .map(Zeroizing::new)
         .map_err(|_| format!("{what}: expected 32 bytes of hex"))?;
-    let scalar = Scalar::from_repr_vartime(bytes.into())
+    let scalar = Scalar::from_repr_vartime((*bytes).into())
+        .map(Zeroizing::new)
         .ok_or_else(|| format!("{what}: value is not below the curve order n"))?;
-    if scalar == Scalar::ZERO {
+    if *scalar == Scalar::ZERO {
         return Err(format!("{what}: the zero key is not a valid secret key"));
     }
     Ok(scalar)
@@ -819,10 +936,10 @@ mod tests {
     fn secret_parsing() {
         assert!(parse_secret(&"00".repeat(32), "x").is_err());
         assert!(parse_secret(&"ff".repeat(32), "x").is_err());
-        let err = parse_secret("01", "--scan-priv").unwrap_err();
-        assert!(err.starts_with("--scan-priv:"), "{err}");
+        let err = parse_secret("01", "--scan-priv-file").unwrap_err();
+        assert!(err.starts_with("--scan-priv-file:"), "{err}");
         assert_eq!(
-            parse_secret(&format!("{}01", "00".repeat(31)), "x").unwrap(),
+            *parse_secret(&format!("{}01", "00".repeat(31)), "x").unwrap(),
             Scalar::ONE
         );
     }
@@ -848,7 +965,7 @@ mod tests {
     #[test]
     fn split_final_check_and_apply() {
         let d = parse_secret(&format!("{}2a", "00".repeat(31)), "x").unwrap();
-        let base = ProjectivePoint::GENERATOR * d;
+        let base = ProjectivePoint::GENERATOR * *d;
         let tweak: Tweak = "12345/2/-".parse().unwrap();
         let pubkey = compressed(&tweak.apply_point(&base));
         let found = Found {
@@ -885,28 +1002,28 @@ mod tests {
     /// secret and rejects a secret that does not produce the address's key.
     #[test]
     fn random_final_check_rederives_pubkey() {
-        let k = parse_secret(&format!("{}2a", "00".repeat(31)), "x").unwrap();
+        let k = *parse_secret(&format!("{}2a", "00".repeat(31)), "x").unwrap();
         let pubkey = compressed(&(ProjectivePoint::GENERATOR * k));
         let patterns = pattern_set("sp1qq");
         let addr = address::encode(Network::Mainnet.hrp(), &pubkey, &[2u8; 33]);
         let found = Found {
-            key: Key::Secret(k),
+            key: Key::Secret(Zeroizing::new(k)),
             pubkey,
         };
         final_check(&addr, &found, &patterns).unwrap();
         let wrong = Found {
-            key: Key::Secret(k.add(&Scalar::ONE)),
+            key: Key::Secret(Zeroizing::new(k.add(&Scalar::ONE))),
             pubkey,
         };
         let err = final_check(&addr, &wrong, &patterns).unwrap_err();
         assert!(err.contains("secret key"), "{err}");
         let zero = Found {
-            key: Key::Secret(Scalar::ZERO),
+            key: Key::Secret(Zeroizing::new(Scalar::ZERO)),
             pubkey,
         };
         assert!(final_check(&addr, &zero, &patterns).is_err());
         let other_key = Found {
-            key: Key::Secret(k),
+            key: Key::Secret(Zeroizing::new(k)),
             pubkey: compressed(&ProjectivePoint::GENERATOR),
         };
         let err = final_check(&addr, &other_key, &patterns).unwrap_err();
@@ -933,8 +1050,8 @@ mod tests {
         let cli = Cli::try_parse_from([
             "spaghetti",
             "apply",
-            "--scan-priv",
-            "aa",
+            "--scan-priv-file",
+            "-",
             "--tweak",
             "1/0/+",
         ])
@@ -944,10 +1061,21 @@ mod tests {
             Cli::try_parse_from([
                 "spaghetti",
                 "apply",
+                "--scan-priv-file",
+                "-",
+                "--tweak",
+                "1/9/+"
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "spaghetti",
+                "apply",
                 "--scan-priv",
                 "aa",
                 "--tweak",
-                "1/9/+"
+                "1/0/+"
             ])
             .is_err()
         );

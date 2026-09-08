@@ -22,8 +22,9 @@ spaghetti -k 3 pasta penne      # any-of, stop after 3 matches
 spaghetti -s 02…33-byte-hex pasta   # render the example address with a real spend key
 spaghetti -b 02…33-byte-hex pasta   # split-key mode: seed-recoverable key (see below)
 spaghetti --xpub xpub6… pasta       # same, base key from the xpub of m/352'/0'/0'/1'
+spaghetti --output key.txt pasta    # secret goes to a new 0600 file, not to the terminal
 spaghetti recover --address sp1qq… -b 02…   # find the tweak of a published address
-spaghetti apply --scan-priv <d hex> --tweak 48213946821/1/-   # wallet scan key
+spaghetti apply --scan-priv-file d.hex --tweak 48213946821/1/-   # wallet scan key (- = stdin)
 ```
 
 ```
@@ -38,10 +39,12 @@ spaghetti [OPTIONS] <PATTERN>...
   -b, --base-pubkey <HEX33>    split-key mode: search offsets from this compressed scan pubkey D
       --xpub <XPUB>            split-key mode: D = child 0 (non-hardened) of this extended pubkey (xpub or tpub);
                                give the node m/352'/0'/0'/1' (testnet: m/352'/1'/0'/1'). Mutually exclusive with -b.
+      --output <PATH>          write each match, secret included, to this new file (mode 0600, never
+                               overwritten) and print it without the secret line; random mode only
   -q, --quiet                  no progress output
 
 spaghetti recover --address <SP_ADDRESS> (-b <HEX33> | --xpub <XPUB>) [-c N] [--baby-bits K]
-spaghetti apply --scan-priv <HEX32> --tweak <t/e/s> [--address <SP_ADDRESS>]
+spaghetti apply --scan-priv-file <PATH> --tweak <t/e/s> [--address <SP_ADDRESS>] [--output <PATH>]
 ```
 
 Output per match (stdout; progress goes to stderr):
@@ -53,6 +56,8 @@ spend public key: 03edb2b32ed41a5ece06a36f32e1c8992aff392ea6c6703bc41f1986a53ccf
 address         : sp1qqdpasta8hke4ssthd70q8y4xfwr0dv0m6d4lu2kjlnv0fekm799u2qldk2eja4q6tm8qdgm0xtsu3xf2luujafkxwqaug8ces6jnenmeev8jz5rx
 found after 23.23 M candidates in 101 ms (229.81 M/s)
 ```
+
+With `--output <path>` the same block goes to the file (appended per match with `-k N`) and stdout shows `scan secret key : written to <path>` instead of the key.
 
 ## Seed-recoverable keys (split-key mode)
 
@@ -75,7 +80,7 @@ tweak             : 87960930315849/1/+
 vanity scan pubkey: 02c3d82fa34db5af529b72464bd2f21e1c396d21fb1348a187a76f91a51fd6c998
 spend public key  : 027a1cdf30d2a8a4ff52a66ce9ed0a0dac23ae5c413b5fc5d67d9f73b6f0234dda (example, random)
 address           : sp1qqtpastarfk66755mwfryh5hjrcwrjmfplvf53gv85aherfgl6myesqn6rn0np54g5nl49fnva8ks5rdvywh9csfmtlzavlvlwwm0qg6dmgn7rss5
-scan_priv = λ^1·(d + 87960930315849) mod n   → run: spaghetti apply --scan-priv <d hex> --tweak 87960930315849/1/+
+scan_priv = λ^1·(d + 87960930315849) mod n   → run: spaghetti apply --scan-priv-file <d hex file> --tweak 87960930315849/1/+
 ```
 
 **What to store.** The tweak string, next to the descriptor. It is public data (it reveals nothing about `d`), plaintext is fine, and it is not even required: only the seed is secret, and the tweak can be recomputed. It is not neutral, though: the tweak together with any address of the wallet reveals the standard scan pubkey `D` (`D = s·λ^{-e}·B − t·G`), so publishing the tweak links the vanity wallet to the wallet's standard BIP352 address if that address was ever used.
@@ -88,7 +93,7 @@ spaghetti recover --address sp1qqtpasta… -b <D>      # or --xpub <xpub of m/35
 
 For each of the six `(e, s)` variants it solves `s·λ^{-e}·B − D = t·G` for `t < 2^52` with baby-step giant-step: a table of `x(j·G)` for `j < 2^K` (`--baby-bits`, default 22, 60 MB, built in 0.4 s) and up to `2^(52−K)` giant steps per variant, walked with the same batched-inversion machinery as the search. The giant steps run in growing levels over all six variants, so a small `t` is found quickly whatever its variant. Measured on an Apple M2 Pro with 12 threads: about 200 M giant steps/s, i.e. up to 5.5 s per variant at the default `K`; the example above (`t ≈ 5·2^44`, third variant) took 12 s and the worst case (`t = 2^51 + 12345`, last variant) 30 s. Each extra baby bit halves the giant-step work and doubles the table (`--baby-bits 24`: 240 MB, ~4× faster).
 
-**Wallet key.** `spaghetti apply --scan-priv <d hex> --tweak <t/e/s> [--address sp1qq…]` prints the vanity scan secret key (`s·λ^e·(d + t) mod n`) and its public key, and checks them against the address if given. Import that secret key as the wallet's scan key; the spend key is unchanged.
+**Wallet key.** `spaghetti apply --scan-priv-file <path> --tweak <t/e/s> [--address sp1qq…] [--output <path>]` reads the hex `d` from the file (`-` for stdin, so it never appears on a command line or in shell history), prints the vanity scan secret key (`s·λ^e·(d + t) mod n`) and its public key, and checks them against the address if given; with `--output` the key goes to a new 0600 file instead. Import that secret key as the wallet's scan key; the spend key is unchanged.
 
 **Labels caveat.** BIP352 label tweaks are `hash(ser_256(b_scan) ‖ ser_32(m))`, so labeled spend keys, and the change label `m = 0`, depend on the scan key. Everything must be derived from the vanity scan key, and the switch has to happen before the first address is issued: addresses (and their labels) handed out under the original `d` are not detectable with the vanity key.
 
@@ -148,7 +153,9 @@ Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit impleme
 ## Security notes
 
 - The scan key **only reveals incoming payments** (it lets the holder detect outputs, not spend them), but treat it like any wallet secret: whoever has it can link every payment to you.
-- A vanity scan key from the default mode is not BIP32-derived. Wallets normally derive the scan key from the seed (`m/352'/0'/0'/1'/0`), so such a key cannot be recovered from the seed phrase: back it up separately and inject it into the wallet instead of deriving it. Split-key mode (above) avoids this: the key is the derived one plus a public, recomputable tweak.
+- **Random mode is for throwaway or test keys.** Its key is not BIP32-derived: wallets derive the scan key from the seed (`m/352'/0'/0'/1'/0`), so such a key cannot be recovered from the seed phrase, and it exists in this program's memory and output. **Split-key mode is the way to mine a key for a real wallet**: `spaghetti` only ever sees the public base key and prints a public tweak; the secret is computed by `apply`, which reads `d` from a file or stdin, never from the command line.
+- `--output` writes the secret to a new file with mode 0600 and refuses to overwrite an existing one; stdout then carries everything but the secret line. Secrets (scalars, their hex, the file read by `apply`) are held in zeroizing wrappers and wiped when dropped. Both are best effort: the OS can still swap or core-dump the process.
+- Operational rules for a real key: build from source and verify the commit signature, run offline, use encrypted swap (or none), do not run inside a terminal that logs its scrollback, and if the key must travel pipe `--output` through `age` or `gpg` rather than copying the plaintext file.
 - Keys come from the OS RNG (`getrandom` via `k256`); the search walks a public additive sequence from that random start, so every found key is as unpredictable as its start point. The randomly generated spend key printed when `-s` is omitted is a throwaway used only to render an example address.
 - Several keys from one run (`-k N`) are unrelated: after every match the worker moves to a fresh random start. Keys that came from one walk would differ by a small public offset (times `λ^e`, `±1`), which lets anyone prove they belong together (baby-step giant-step on the difference) and turns one leaked secret into the others.
 - Split-key mode is linkable by construction: every vanity key is `D` plus a small public offset, so all vanity addresses made from one base key `D` (across reruns and tweaks) are provably related to each other, and a published tweak reveals `D` itself (see "What to store"). Use it for one vanity key per wallet, and a random-mode key when the addresses must not be linkable.

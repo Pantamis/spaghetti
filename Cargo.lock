@@ -547,6 +547,7 @@ dependencies = [
  "num-bigint",
  "num-traits",
  "sha2",
+ "zeroize",
 ]
 
 [[package]]
