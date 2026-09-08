@@ -523,4 +523,87 @@ mod tests {
             assert_eq!(a.top_limb(), u64::from_be_bytes(head));
         }
     }
+
+    fn limbs(v: &BigUint) -> [u64; 4] {
+        let mut out = [0u64; 4];
+        for (slot, digit) in out.iter_mut().zip(v.to_u64_digits()) {
+            *slot = digit;
+        }
+        out
+    }
+
+    /// The third fold of `reduce_wide` is unreachable with random inputs
+    /// (probability about 2^-189): craft products with `lo + hi·c` just below
+    /// `2^257` so the second fold overflows.
+    #[test]
+    fn reduce_wide_third_fold_is_correct() {
+        let c = BigUint::from(C);
+        let two256 = BigUint::one() << 256u32;
+        for extra in 0u64..2000 {
+            let target = (&two256 << 1u32) - BigUint::one() - BigUint::from(extra);
+            let hi = (&two256 + &c - BigUint::one()) / &c + BigUint::from(extra % 7);
+            let hic = &hi * &c;
+            if hic > target {
+                continue;
+            }
+            let lo = &target - &hic;
+            if lo >= two256 {
+                continue;
+            }
+            let mut w = [0u64; 8];
+            w[..4].copy_from_slice(&limbs(&lo));
+            w[4..].copy_from_slice(&limbs(&hi));
+            let got = reduce_wide(&w);
+            check_canonical(&got);
+            assert_eq!(to_big(&got), (&lo + (&hi << 256u32)) % p(), "extra {extra}");
+        }
+    }
+
+    /// Differential fuzz against the big-integer reference, biased toward
+    /// all-ones limbs, values next to p, high bits set and tiny values.
+    #[test]
+    fn heavy_fuzz_vs_bigint() {
+        let pp = p();
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        let biased = |rng: &mut Rng| -> Fe {
+            let mut l = [rng.next(), rng.next(), rng.next(), rng.next()];
+            match rng.next() % 6 {
+                0 => {
+                    for x in &mut l {
+                        if rng.next().is_multiple_of(2) {
+                            *x = u64::MAX;
+                        }
+                    }
+                }
+                1 => {
+                    l = P;
+                    l[0] = l[0].wrapping_sub(rng.next() % 3);
+                }
+                2 => {
+                    l[3] |= 1 << 63;
+                    l[2] = u64::MAX;
+                    l[1] = u64::MAX;
+                }
+                3 => l = [rng.next() % 4, 0, 0, 0],
+                _ => {}
+            }
+            let mut fe = Fe(l);
+            fe.reduce_once();
+            fe
+        };
+        for _ in 0..50_000 {
+            let a = biased(&mut rng);
+            let b = biased(&mut rng);
+            let (ba, bb) = (to_big(&a), to_big(&b));
+            assert!(ba < pp && bb < pp);
+            let m = a.mul(&b);
+            check_canonical(&m);
+            assert_eq!(to_big(&m), (&ba * &bb) % &pp);
+            assert_eq!(a.square(), a.mul(&a));
+            assert_eq!(to_big(&a.add(&b)), (&ba + &bb) % &pp);
+            assert_eq!(to_big(&a.sub(&b)), (&ba + &pp - &bb) % &pp);
+            assert_eq!(to_big(&a.neg()), (&pp - &ba) % &pp);
+            assert_eq!(Fe::from_bytes_be(&a.to_bytes_be()), a);
+        }
+    }
 }
