@@ -2,7 +2,7 @@
 
 Vanity address generator for [BIP352](https://github.com/bitcoin/bips/blob/master/bip-0352.mediawiki) silent payments. It finds a **scan secret key** whose derived addresses start with a chosen prefix, e.g. `sp1qq?pasta…`.
 
-A v0 silent payment address is `bech32m(hrp, q ++ convertbits(ser_P(B_scan) ++ ser_P(B_m)))`. The first 52 data characters depend on `B_scan` only, so one vanity scan key gives the prefix to every address derived from it, including labeled ones: a wallet that hands out one labeled address per contact or customer shares one scan key across all of them, so a vanity scan key gives every labeled address the prefix.
+A v0 silent payment address is `bech32m(hrp, q ++ convertbits(ser_P(B_scan) ++ ser_P(B_m)))`. The first 52 data characters depend on `B_scan` only, so one vanity scan key gives the prefix to every address derived from it, including the labeled addresses a wallet hands out per contact or customer.
 
 ## Install
 

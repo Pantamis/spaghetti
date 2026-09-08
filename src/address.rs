@@ -4,9 +4,31 @@
 
 use bech32::primitives::decode::CheckedHrpstring;
 use bech32::{Bech32m, ByteIterExt, Fe32, Fe32IterExt, Hrp};
+use clap::ValueEnum;
 
-pub const HRP_MAINNET: Hrp = Hrp::parse_unchecked("sp");
-pub const HRP_TESTNET: Hrp = Hrp::parse_unchecked("tsp");
+/// BIP352 defines two hrps; regtest has no standard one and is not supported.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
+pub enum Network {
+    /// hrp `sp`
+    Mainnet,
+    /// hrp `tsp` (BIP352: testnet and signet)
+    Testnet,
+}
+
+impl Network {
+    pub fn hrp(self) -> Hrp {
+        match self {
+            Network::Mainnet => Hrp::parse_unchecked("sp"),
+            Network::Testnet => Hrp::parse_unchecked("tsp"),
+        }
+    }
+
+    fn from_hrp(hrp: Hrp) -> Option<Network> {
+        [Network::Mainnet, Network::Testnet]
+            .into_iter()
+            .find(|network| network.hrp() == hrp)
+    }
+}
 
 /// Encodes a v0 silent payment address from compressed scan and spend public keys.
 pub fn encode(hrp: Hrp, scan: &[u8; 33], spend: &[u8; 33]) -> String {
@@ -20,10 +42,10 @@ pub fn encode(hrp: Hrp, scan: &[u8; 33], spend: &[u8; 33]) -> String {
         .collect()
 }
 
-/// Strictly decodes a v0 silent payment address into `(hrp, scan, spend)`:
-/// bech32m, version `q`, exactly 66 payload bytes and zero padding bits (the
-/// re-encoded keys must reproduce the input).
-pub fn decode(address: &str) -> Result<(Hrp, [u8; 33], [u8; 33]), String> {
+/// Strictly decodes a v0 silent payment address into `(network, scan, spend)`:
+/// bech32m, version `q`, exactly 66 payload bytes, zero padding bits (the
+/// re-encoded keys must reproduce the input) and a BIP352 hrp.
+pub fn decode(address: &str) -> Result<(Network, [u8; 33], [u8; 33]), String> {
     let mut parsed = CheckedHrpstring::new::<Bech32m>(address).map_err(|e| e.to_string())?;
     let version = parsed
         .remove_witness_version()
@@ -46,7 +68,9 @@ pub fn decode(address: &str) -> Result<(Hrp, [u8; 33], [u8; 33]), String> {
     if encode(hrp, &scan, &spend) != address.to_ascii_lowercase() {
         return Err("address has non-zero padding bits".to_string());
     }
-    Ok((hrp, scan, spend))
+    let network = Network::from_hrp(hrp)
+        .ok_or_else(|| format!("hrp '{hrp}' is neither sp (mainnet) nor tsp (testnet/signet)"))?;
+    Ok((network, scan, spend))
 }
 
 #[cfg(test)]
@@ -83,7 +107,7 @@ mod tests {
     fn bip352_test_vector() {
         let scan = compressed(VECTOR_SCAN);
         let spend = compressed(VECTOR_SPEND);
-        let address = encode(HRP_MAINNET, &scan, &spend);
+        let address = encode(Network::Mainnet.hrp(), &scan, &spend);
         assert_eq!(address, VECTOR_ADDRESS);
         assert_eq!(address.len(), 116);
     }
@@ -92,8 +116,8 @@ mod tests {
     fn decode_roundtrip() {
         let scan = compressed(VECTOR_SCAN);
         let spend = compressed(VECTOR_SPEND);
-        let (hrp, got_scan, got_spend) = decode(VECTOR_ADDRESS).unwrap();
-        assert_eq!(hrp, HRP_MAINNET);
+        let (network, got_scan, got_spend) = decode(VECTOR_ADDRESS).unwrap();
+        assert_eq!(network, Network::Mainnet);
         assert_eq!(got_scan, scan);
         assert_eq!(got_spend, spend);
         // Uppercase is valid bech32; mixed case is not.
@@ -107,26 +131,29 @@ mod tests {
     fn testnet_hrp() {
         let scan = compressed(VECTOR_SCAN);
         let spend = compressed(VECTOR_SPEND);
-        let address = encode(HRP_TESTNET, &scan, &spend);
+        let address = encode(Network::Testnet.hrp(), &scan, &spend);
         assert!(address.starts_with("tsp1qq"));
-        let (hrp, got_scan, _) = decode(&address).unwrap();
-        assert_eq!(hrp, HRP_TESTNET);
+        let (network, got_scan, _) = decode(&address).unwrap();
+        assert_eq!(network, Network::Testnet);
         assert_eq!(got_scan, scan);
     }
 
     #[test]
     fn decode_is_strict() {
-        let err = decode(&raw(HRP_MAINNET, &[2u8; 33])).unwrap_err();
+        let hrp = Network::Mainnet.hrp();
+        let err = decode(&raw(hrp, &[2u8; 33])).unwrap_err();
         assert!(err.contains("33 bytes"), "{err}");
-        let err = decode(&raw(HRP_MAINNET, &[7u8; 70])).unwrap_err();
+        let err = decode(&raw(hrp, &[7u8; 70])).unwrap_err();
         assert!(err.contains("70 bytes"), "{err}");
+        let err = decode(&raw(Hrp::parse_unchecked("bc"), &[1u8; 66])).unwrap_err();
+        assert!(err.contains("hrp 'bc'"), "{err}");
         // 66 bytes = 105.6 groups: the last group carries 2 padding bits.
         let mut fes: Vec<Fe32> = [1u8; 66].iter().copied().bytes_to_fes().collect();
         assert_eq!(fes.len(), 106);
         fes[105] = Fe32::try_from(fes[105].to_u8() | 0x03).unwrap();
         let dirty: String = fes
             .into_iter()
-            .with_checksum::<Bech32m>(&HRP_MAINNET)
+            .with_checksum::<Bech32m>(&hrp)
             .with_witness_version(Fe32::Q)
             .chars()
             .collect();
@@ -137,7 +164,7 @@ mod tests {
             .iter()
             .copied()
             .bytes_to_fes()
-            .with_checksum::<Bech32m>(&HRP_MAINNET)
+            .with_checksum::<Bech32m>(&hrp)
             .with_witness_version(Fe32::P)
             .chars()
             .collect();
@@ -147,7 +174,7 @@ mod tests {
             .iter()
             .copied()
             .bytes_to_fes()
-            .with_checksum::<bech32::Bech32>(&HRP_MAINNET)
+            .with_checksum::<bech32::Bech32>(&hrp)
             .with_witness_version(Fe32::Q)
             .chars()
             .collect();

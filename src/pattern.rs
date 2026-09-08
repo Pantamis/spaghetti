@@ -6,31 +6,17 @@
 //! are the constant `000000` and `1` of the SEC1 tag byte (`0x02`/`0x03`),
 //! stream bit 7 is the y parity, stream bits 8.. are the x coordinate.
 
+use crate::address::Network;
 use crate::field::Fe;
 
-pub const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+const CHARSET: &[u8; 32] = b"qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 
 /// Characters allowed in the 6th position for each y parity.
-pub const EVEN_CHARS: &str = "gf2t";
-pub const ODD_CHARS: &str = "vdw0";
+const EVEN_CHARS: &str = "gf2t";
+const ODD_CHARS: &str = "vdw0";
 
 /// Chars after the 6th one must keep every masked bit inside x's 256 bits.
-pub const MAX_TAIL_CHARS: usize = 50;
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Network {
-    Mainnet,
-    Testnet,
-}
-
-impl Network {
-    pub fn hrp_str(self) -> &'static str {
-        match self {
-            Network::Mainnet => "sp",
-            Network::Testnet => "tsp",
-        }
-    }
-}
+const MAX_TAIL_CHARS: usize = 50;
 
 fn charset_index(c: u8) -> Option<u8> {
     CHARSET.iter().position(|&x| x == c).map(|i| i as u8)
@@ -41,8 +27,6 @@ fn charset_index(c: u8) -> Option<u8> {
 pub struct Pattern {
     /// Normalised full text, e.g. `sp1qq?pas` (lowercase, always full form).
     pub text: String,
-    /// Prefix chars after `<hrp>1q` (starting with the constant `q`).
-    pub chars: Vec<u8>,
     mask: [u8; 32],
     value: [u8; 32],
     /// Number of leading x bytes that carry any masked bit.
@@ -63,7 +47,8 @@ impl Pattern {
         if lower.is_empty() {
             return Err("pattern is empty".to_string());
         }
-        let hrp = network.hrp_str();
+        let hrp = network.hrp();
+        let hrp = hrp.as_str();
         let full = format!("{hrp}1qq?");
         let tail: String = if let Some(pos) = lower.find('1') {
             let (given_hrp, rest) = (&lower[..pos], &lower[pos + 1..]);
@@ -147,6 +132,8 @@ impl Pattern {
     }
 
     /// `chars[0]` is the constant `q` group, `chars[1]` the parity group, etc.
+    /// Every char is `?` or a validated bech32 char, and `chars[1]` is one of
+    /// `EVEN_CHARS`/`ODD_CHARS`, so stream bits 0..=6 are the constant tag bits.
     fn compile(network: Network, chars: &[u8]) -> Result<Pattern, String> {
         let mut mask = [0u8; 32];
         let mut value = [0u8; 32];
@@ -161,16 +148,7 @@ impl Pattern {
                 let stream_bit = 5 * g as u32 + k;
                 let bit = (v >> (4 - k)) & 1 == 1;
                 match stream_bit {
-                    0..=5 => {
-                        if bit {
-                            return Err("internal: constant tag bit set".to_string());
-                        }
-                    }
-                    6 => {
-                        if !bit {
-                            return Err("internal: constant tag bit clear".to_string());
-                        }
-                    }
+                    0..=6 => {}
                     7 => parity = Some(bit),
                     _ => {
                         let x_bit = stream_bit - 8;
@@ -194,10 +172,13 @@ impl Pattern {
         let mask_hi = u64::from_be_bytes(hi);
         hi.copy_from_slice(&value[..8]);
         let value_hi = u64::from_be_bytes(hi);
-        let text = format!("{}1q{}", network.hrp_str(), String::from_utf8_lossy(chars));
+        let text = format!(
+            "{}1q{}",
+            network.hrp().as_str(),
+            String::from_utf8_lossy(chars)
+        );
         Ok(Pattern {
             text,
-            chars: chars.to_vec(),
             mask,
             value,
             len_bytes,
@@ -222,8 +203,7 @@ impl Pattern {
         if self.len_bytes <= 8 {
             return true;
         }
-        let bytes = x.to_bytes_be();
-        self.matches_bytes(&bytes)
+        self.matches_bytes(&x.to_bytes_be())
     }
 
     /// Match on a big-endian x coordinate.
@@ -264,10 +244,10 @@ impl PatternSet {
         Ok(PatternSet { patterns, keys })
     }
 
-    /// Index of the first matching pattern for this x coordinate.
+    /// The first pattern matching this x coordinate.
     #[inline]
-    pub fn find(&self, x: &Fe) -> Option<usize> {
-        self.patterns.iter().position(|p| p.matches_fe(x))
+    pub fn find(&self, x: &Fe) -> Option<&Pattern> {
+        self.patterns.iter().find(|p| p.matches_fe(x))
     }
 
     /// Expected candidates for a hit on any pattern (union approximated as sum of rates).
@@ -404,7 +384,7 @@ mod tests {
             let scan: [u8; 33] = sec1.as_bytes().try_into().unwrap();
             let x: [u8; 32] = scan[1..].try_into().unwrap();
             let odd = scan[0] == 0x03;
-            let addr = address::encode(address::HRP_MAINNET, &scan, &spend);
+            let addr = address::encode(Network::Mainnet.hrp(), &scan, &spend);
             for len in 5..=56 {
                 let prefix = &addr[..len];
                 let fixed = Pattern::parse(prefix, Network::Mainnet).unwrap();
@@ -450,5 +430,6 @@ mod tests {
         assert_eq!(set.patterns.len(), 2);
         let e = set.expected_candidates();
         assert!(e > 2f64.powi(14) && e < 2f64.powi(15), "{e}");
+        assert_eq!(set.find(&Fe::ZERO), None);
     }
 }

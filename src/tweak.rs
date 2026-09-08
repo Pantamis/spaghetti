@@ -1,27 +1,25 @@
 //! Split-key tweak `<t>/<e>/<s>`: the public data that turns a BIP32-derived
-//! scan key `d` into the vanity scan key `s·λ^e·(d + t) mod n`.
-//!
-//! Range arithmetic shared by the search and `recover`: the split-mode offset
-//! space is cut into `SPLIT_RANGES = 2^(MAX_TWEAK_BITS − RANGE_BITS) = 256`
-//! ranges `[i·2^RANGE_BITS, (i+1)·2^RANGE_BITS)` that worker threads take from
-//! a shared queue, so every visited `t` is below `2^MAX_TWEAK_BITS`, which is
-//! the range `recover` scans.
+//! scan key `d` into the vanity scan key `s·λ^e·(d + t) mod n`, with
+//! `t < 2^MAX_TWEAK_BITS`, `e ∈ {0, 1, 2}` and `s = ±1`.
 
 use std::fmt;
 use std::str::FromStr;
 
-use k256::{ProjectivePoint, Scalar};
+use k256::elliptic_curve::scalar::FromUintUnchecked;
+use k256::{ProjectivePoint, Scalar, U256};
 
-use crate::search::lambda;
-
-/// Offsets covered by one split-mode range: `2^44`.
-pub const RANGE_BITS: u32 = 44;
-/// Upper bound on every published tweak offset: `2^52`.
+/// Upper bound on every published tweak offset: `2^52`. The search only visits
+/// offsets below it, and `recover` only scans below it.
 pub const MAX_TWEAK_BITS: u32 = 52;
-/// Number of split-mode ranges, `2^(52 − 44)`.
-pub const SPLIT_RANGES: usize = 1 << (MAX_TWEAK_BITS - RANGE_BITS);
 
-/// `λ^e` for `e ∈ {0, 1, 2}` (`λ³ = 1`, so any `e` is reduced mod 3).
+/// The secp256k1 GLV scalar λ: λ·(x, y) = (β·x, y), λ³ = 1.
+fn lambda() -> Scalar {
+    Scalar::from_uint_unchecked(U256::from_be_hex(
+        "5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72",
+    ))
+}
+
+/// `λ^e` for `e ∈ {0, 1, 2}` (any `e` is reduced mod 3).
 pub fn lambda_pow(e: u8) -> Scalar {
     let mut out = Scalar::ONE;
     for _ in 0..e % 3 {
@@ -57,6 +55,14 @@ impl Tweak {
     pub fn formula(&self) -> String {
         let sign = if self.negate { "-" } else { "" };
         format!("{sign}λ^{}·(d + {}) mod n", self.endo, self.t)
+    }
+
+    /// The six `(e, s)` variants of one offset.
+    #[cfg(test)]
+    pub fn variants(t: u64) -> Vec<Tweak> {
+        (0..3u8)
+            .flat_map(|endo| [false, true].map(|negate| Tweak { t, endo, negate }))
+            .collect()
     }
 }
 
@@ -104,22 +110,7 @@ impl FromStr for Tweak {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::NonZeroScalar;
-    use k256::elliptic_curve::Generate;
-
-    fn random_scalar() -> Scalar {
-        *NonZeroScalar::try_generate().unwrap().as_ref()
-    }
-
-    pub fn variants(t: u64) -> Vec<Tweak> {
-        let mut out = Vec::new();
-        for endo in 0..3 {
-            for negate in [false, true] {
-                out.push(Tweak { t, endo, negate });
-            }
-        }
-        out
-    }
+    use crate::search::random_scalar;
 
     #[test]
     fn display_and_parse_roundtrip() {
@@ -133,7 +124,7 @@ mod tests {
             }
         );
         assert_eq!(tweak.to_string(), "48213946821/1/-");
-        for tweak in variants(7).into_iter().chain(variants(0)) {
+        for tweak in Tweak::variants(7).into_iter().chain(Tweak::variants(0)) {
             assert_eq!(tweak.to_string().parse::<Tweak>().unwrap(), tweak);
         }
         let max = Tweak {
@@ -175,9 +166,12 @@ mod tests {
 
     #[test]
     fn apply_matches_apply_point() {
-        let d = random_scalar();
+        let d = random_scalar().unwrap();
         let base = ProjectivePoint::GENERATOR * d;
-        for tweak in variants(48213946821).into_iter().chain(variants(0)) {
+        for tweak in Tweak::variants(48213946821)
+            .into_iter()
+            .chain(Tweak::variants(0))
+        {
             let k = tweak.apply(&d);
             assert_eq!(
                 ProjectivePoint::GENERATOR * k,
@@ -186,7 +180,7 @@ mod tests {
             );
         }
         // The six variants of one offset are six distinct points.
-        let points: Vec<_> = variants(1)
+        let points: Vec<_> = Tweak::variants(1)
             .iter()
             .map(|t| t.apply_point(&base).to_affine())
             .collect();

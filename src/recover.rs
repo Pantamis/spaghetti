@@ -1,5 +1,5 @@
 //! Recover the public tweak of a split-key vanity address from the base scan
-//! key alone: baby-step giant-step over `t < 2^MAX_TWEAK_BITS`.
+//! key alone: baby-step giant-step over `t < 2^max_bits`.
 //!
 //! For each of the six `(e, s)` variants the query is `Q = s·λ^{-e}·B − D`
 //! and we need `t` with `Q = t·G`. Baby steps tabulate `x(j·G)` for
@@ -16,17 +16,25 @@ use k256::elliptic_curve::Group;
 use k256::{ProjectivePoint, Scalar};
 
 use crate::field::Fe;
-use crate::search::{Table, Visit, Worker, affine_xy};
+use crate::search::{Table, Visit, Walk, affine_xy};
 use crate::tweak::{Tweak, lambda_pow};
 
-pub const MIN_BABY_BITS: u32 = 4;
-pub const MAX_BABY_BITS: u32 = 28;
+const MIN_BABY_BITS: u32 = 4;
+const MAX_BABY_BITS: u32 = 28;
+
+/// The six `(e, s)` variants, in search order.
+const VARIANTS: [(u8, bool); 6] = [
+    (0, false),
+    (0, true),
+    (1, false),
+    (1, true),
+    (2, false),
+    (2, true),
+];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
-    /// `K`: baby table holds `2^K` points.
-    pub baby_bits: u32,
-    /// `M`: search `t < 2^M`.
+    /// `M`: search `t < 2^M`; `baby.bits <= M <= 63`.
     pub max_bits: u32,
     pub threads: usize,
     /// Half-batch size of the giant-step walk.
@@ -54,7 +62,7 @@ pub struct BabyTable {
     buckets: Vec<u32>,
     bucket_shift: u32,
     /// Bitmap over the low `bits + 4` bits of the key: cheap negative answers
-    /// (8 MB at K = 22; larger filters were measured slower, see README).
+    /// for the 15 in 16 lookups that miss (8 MB at K = 22).
     filter: Vec<u64>,
     filter_mask: u64,
 }
@@ -70,10 +78,10 @@ impl BabyTable {
         let m = 1u64 << bits;
         let table = Table::new(half, ProjectivePoint::GENERATOR);
         let mut k0 = table.half as u64 + 1;
-        let mut worker = Worker::with_start(&table, Scalar::from(k0));
+        let mut walk = Walk::new(&table, Scalar::from(k0), ProjectivePoint::IDENTITY);
         let mut entries: Vec<(u64, u32)> = Vec::with_capacity(m as usize);
         while (k0 - table.half as u64) < m {
-            let visited = worker.batch(|offset, x| {
+            let visited = walk.batch(|offset: i64, x: &Fe| {
                 let j = (k0 as i64 + offset) as u64;
                 if j < m {
                     entries.push((x.top_limb(), j as u32));
@@ -119,12 +127,12 @@ impl BabyTable {
     }
 
     /// `m = 2^K`.
-    pub fn size(&self) -> u64 {
+    fn size(&self) -> u64 {
         1 << self.bits
     }
 
     /// Pushes every `j` with `x(j·G)` sharing the top 64 bits of `x`.
-    pub fn matches(&self, x: &Fe, out: &mut Vec<u32>) {
+    fn matches(&self, x: &Fe, out: &mut Vec<u32>) {
         let key = x.top_limb();
         if self.filter_hit(key) {
             self.scan_bucket(key, out);
@@ -166,7 +174,7 @@ fn slow_batch<F: FnMut(i64, ProjectivePoint)>(
 }
 
 /// `Q = s·λ^{-e}·B − D`, the point that must equal `t·G`.
-pub fn query(
+fn query(
     base: &ProjectivePoint,
     target: &ProjectivePoint,
     endo: u8,
@@ -194,47 +202,27 @@ fn levels(total: u64) -> Vec<(u64, u64)> {
 }
 
 /// Finds the tweak with `tweak.apply_point(base) == target`, trying the six
-/// `(e, s)` variants level by level. `Ok(None)` when no `t < 2^max_bits` works.
+/// `(e, s)` variants level by level. `None` when no `t < 2^max_bits` works.
 pub fn recover(
     base: &ProjectivePoint,
     target: &ProjectivePoint,
     params: &Params,
     baby: &BabyTable,
     progress: &mut dyn FnMut(Progress),
-) -> Result<Option<Tweak>, String> {
-    if params.max_bits < baby.bits || params.max_bits > 63 {
-        return Err("internal: max_bits must be between baby_bits and 63".to_string());
-    }
-    let variants: Vec<(usize, u8, bool)> = (0..3u8)
-        .flat_map(|e| [(e, false), (e, true)])
-        .enumerate()
-        .map(|(variant, (endo, negate))| (variant, endo, negate))
-        .collect();
-    let queries: Vec<ProjectivePoint> = variants
-        .iter()
-        .map(|&(_, endo, negate)| query(base, target, endo, negate))
-        .collect();
-    let per_variant = 1u64 << (params.max_bits - baby.bits);
-    let total = per_variant * variants.len() as u64;
-    let verified = |t: u64, endo: u8, negate: bool| -> Result<Tweak, String> {
-        let tweak = Tweak { t, endo, negate };
-        if tweak.apply_point(base) != *target {
-            return Err(format!(
-                "internal: recovered tweak {tweak} does not reproduce the target key"
-            ));
-        }
-        Ok(tweak)
-    };
-    for (q, &(_, endo, negate)) in queries.iter().zip(&variants) {
+) -> Option<Tweak> {
+    let queries = VARIANTS.map(|(endo, negate)| query(base, target, endo, negate));
+    for (q, (endo, negate)) in queries.iter().zip(VARIANTS) {
         if bool::from(q.is_identity()) {
-            return verified(0, endo, negate).map(Some);
+            return Some(Tweak { t: 0, endo, negate });
         }
     }
-    let giant = GiantTable::new(params, baby);
+    let per_variant = 1u64 << (params.max_bits - baby.bits);
+    let total = per_variant * VARIANTS.len() as u64;
+    let giant = Giant::new(baby, params);
     let mut completed = 0u64;
     for (lo, hi) in levels(per_variant) {
-        for (q, &(variant, endo, negate)) in queries.iter().zip(&variants) {
-            let found = giant.giant_steps(q, lo, hi, &mut |done| {
+        for (variant, (q, (endo, negate))) in queries.iter().zip(VARIANTS).enumerate() {
+            let found = giant.steps(q, lo, hi, &mut |done| {
                 progress(Progress {
                     variant,
                     endo,
@@ -245,25 +233,26 @@ pub fn recover(
             });
             completed += hi - lo;
             if let Some(t) = found {
-                return verified(t, endo, negate).map(Some);
+                return Some(Tweak { t, endo, negate });
             }
         }
     }
-    Ok(None)
+    None
 }
 
-/// Walk table for the giant steps (generator `−m·G`) plus the search bounds.
-struct GiantTable<'a> {
+/// The giant-step walk: table for generator `−m·G`, baby table, bounds.
+struct Giant<'a> {
     table: Table,
     baby: &'a BabyTable,
     threads: usize,
+    /// `2^max_bits`: offsets at or above it are not reported.
     max: u64,
 }
 
-impl<'a> GiantTable<'a> {
-    fn new(params: &Params, baby: &'a BabyTable) -> GiantTable<'a> {
+impl<'a> Giant<'a> {
+    fn new(baby: &'a BabyTable, params: &Params) -> Giant<'a> {
         let m = baby.size();
-        GiantTable {
+        Giant {
             table: Table::new(params.half, -(ProjectivePoint::GENERATOR * Scalar::from(m))),
             baby,
             threads: params.threads.max(1),
@@ -273,17 +262,16 @@ impl<'a> GiantTable<'a> {
 
     /// Multi-threaded giant steps `i ∈ [lo, hi)` for one query; returns the
     /// first `t` found. `progress(done)` is called every 100 ms.
-    fn giant_steps(
+    fn steps(
         &self,
         q: &ProjectivePoint,
         lo: u64,
         hi: u64,
         progress: &mut dyn FnMut(u64),
     ) -> Option<u64> {
-        let table = &self.table;
         let span = hi - lo;
         let chunk = span.div_ceil(self.threads as u64);
-        let batches = chunk.div_ceil(table.step());
+        let batches = chunk.div_ceil(self.table.step());
         let stop = AtomicBool::new(false);
         let done = AtomicU64::new(0);
         let (sender, receiver) = mpsc::channel::<u64>();
@@ -296,15 +284,9 @@ impl<'a> GiantTable<'a> {
                 }
                 let sender = sender.clone();
                 let (stop, done) = (&stop, &done);
-                let ctx = GiantContext {
-                    q,
-                    baby: self.baby,
-                    m: self.baby.size(),
-                    max: self.max,
-                };
                 scope.spawn(move || {
-                    let k0 = start + table.half as u64;
-                    if let Some(t) = ctx.walk(table, k0, batches, stop, done) {
+                    let k0 = start + self.table.half as u64;
+                    if let Some(t) = self.walk(q, k0, batches, stop, done) {
                         let _ = sender.send(t);
                     }
                 });
@@ -326,26 +308,19 @@ impl<'a> GiantTable<'a> {
         });
         result
     }
-}
 
-struct GiantContext<'a> {
-    q: &'a ProjectivePoint,
-    baby: &'a BabyTable,
-    m: u64,
-    max: u64,
-}
-
-impl GiantContext<'_> {
-    /// Walks `batches` batches from `k0`; returns the first verified `t`.
+    /// Walks `batches` batches of `Q − i·m·G` from `i = k0`; returns the
+    /// smallest verified `t` of the first batch that has one.
     fn walk(
         &self,
-        table: &Table,
+        q: &ProjectivePoint,
         mut k0: u64,
         batches: u64,
         stop: &AtomicBool,
         done: &AtomicU64,
     ) -> Option<u64> {
-        let mut worker = Worker::with_base(table, Scalar::from(k0), *self.q);
+        let table = &self.table;
+        let mut walk = Walk::new(table, Scalar::from(k0), *q);
         let mut hits: Vec<u64> = Vec::new();
         let mut js: Vec<u32> = Vec::new();
         let half = table.half as i64;
@@ -358,7 +333,7 @@ impl GiantContext<'_> {
             if stop.load(Ordering::Relaxed) {
                 return None;
             }
-            let visited = worker.batch_with(TopCollector {
+            let visited = walk.batch(TopCollector {
                 tops: &mut tops,
                 half,
             });
@@ -375,18 +350,18 @@ impl GiantContext<'_> {
                 for &(idx, key) in &filtered {
                     self.baby.scan_bucket(key, &mut js);
                     for j in js.drain(..) {
-                        self.check(k0 as i64 + idx as i64 - half, j, &mut hits);
+                        self.check(q, k0 as i64 + idx as i64 - half, j, &mut hits);
                     }
                 }
             } else {
-                slow_batch(table, self.q, k0, |offset, point| {
+                slow_batch(table, q, k0, |offset, point| {
                     let i = k0 as i64 + offset;
                     if bool::from(point.is_identity()) {
-                        self.check(i, 0, &mut hits);
+                        self.check(q, i, 0, &mut hits);
                     } else {
                         self.baby.matches(&affine_xy(&point).0, &mut js);
                         for j in js.drain(..) {
-                            self.check(i, j, &mut hits);
+                            self.check(q, i, j, &mut hits);
                         }
                     }
                 });
@@ -401,16 +376,16 @@ impl GiantContext<'_> {
     }
 
     /// x-match at giant step `i` against baby `j`: verifies `t = i·m ± j` with k256.
-    fn check(&self, i: i64, j: u32, hits: &mut Vec<u64>) {
+    fn check(&self, q: &ProjectivePoint, i: i64, j: u32, hits: &mut Vec<u64>) {
         if i < 0 {
             return;
         }
-        let base = i as u64 * self.m;
+        let base = i as u64 * self.baby.size();
         for t in [base.checked_add(j as u64), base.checked_sub(j as u64)]
             .into_iter()
             .flatten()
         {
-            if t < self.max && ProjectivePoint::GENERATOR * Scalar::from(t) == *self.q {
+            if t < self.max && ProjectivePoint::GENERATOR * Scalar::from(t) == *q {
                 hits.push(t);
             }
         }
@@ -433,26 +408,14 @@ impl Visit for TopCollector<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use k256::NonZeroScalar;
-    use k256::elliptic_curve::Generate;
+    use crate::search::random_scalar;
 
-    fn random_scalar() -> Scalar {
-        *NonZeroScalar::try_generate().unwrap().as_ref()
-    }
-
-    fn params(baby_bits: u32, max_bits: u32, half: usize) -> Params {
+    fn params(max_bits: u32, half: usize) -> Params {
         Params {
-            baby_bits,
             max_bits,
             threads: 2,
             half,
         }
-    }
-
-    fn variants(t: u64) -> Vec<Tweak> {
-        (0..3u8)
-            .flat_map(|endo| [false, true].map(|negate| Tweak { t, endo, negate }))
-            .collect()
     }
 
     #[test]
@@ -478,9 +441,9 @@ mod tests {
 
     #[test]
     fn query_inverts_apply_point() {
-        let d = random_scalar();
+        let d = random_scalar().unwrap();
         let base = ProjectivePoint::GENERATOR * d;
-        for tweak in variants(123_456) {
+        for tweak in Tweak::variants(123_456) {
             let target = tweak.apply_point(&base);
             let q = query(&base, &target, tweak.endo, tweak.negate);
             assert_eq!(
@@ -495,27 +458,24 @@ mod tests {
     /// the target point (small baby table, reduced range, 2 threads).
     #[test]
     fn recovers_all_variants() {
-        let d = random_scalar();
+        let d = random_scalar().unwrap();
         let base = ProjectivePoint::GENERATOR * d;
         let baby = BabyTable::build(16, 64).unwrap();
-        let p = params(16, 30, 64);
+        let p = params(30, 64);
         let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        for endo in 0..3u8 {
-            for negate in [false, true] {
-                seed ^= seed << 13;
-                seed ^= seed >> 7;
-                seed ^= seed << 17;
-                let tweak = Tweak {
-                    t: seed & ((1 << 30) - 1),
-                    endo,
-                    negate,
-                };
-                let target = tweak.apply_point(&base);
-                let got = recover(&base, &target, &p, &baby, &mut |_| {})
-                    .unwrap()
-                    .unwrap_or_else(|| panic!("no tweak for {tweak}"));
-                assert_eq!(got.apply_point(&base), target, "{tweak} vs {got}");
-            }
+        for (endo, negate) in VARIANTS {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            let tweak = Tweak {
+                t: seed & ((1 << 30) - 1),
+                endo,
+                negate,
+            };
+            let target = tweak.apply_point(&base);
+            let got = recover(&base, &target, &p, &baby, &mut |_| {})
+                .unwrap_or_else(|| panic!("no tweak for {tweak}"));
+            assert_eq!(got.apply_point(&base), target, "{tweak} vs {got}");
         }
     }
 
@@ -524,12 +484,11 @@ mod tests {
     /// infinity (`t = H·m`) and the range end.
     #[test]
     fn recovers_degenerate_offsets() {
-        let d = random_scalar();
+        let d = random_scalar().unwrap();
         let base = ProjectivePoint::GENERATOR * d;
         let half = 8usize;
         let baby = BabyTable::build(8, half).unwrap();
         let p = Params {
-            baby_bits: 8,
             max_bits: 20,
             threads: 3,
             half,
@@ -553,10 +512,9 @@ mod tests {
             (1 << 19) + m * 7 - 1,
         ];
         for t in offsets {
-            for tweak in variants(t) {
+            for tweak in Tweak::variants(t) {
                 let target = tweak.apply_point(&base);
                 let got = recover(&base, &target, &p, &baby, &mut |_| {})
-                    .unwrap()
                     .unwrap_or_else(|| panic!("no tweak for {tweak}"));
                 assert_eq!(got.apply_point(&base), target, "{tweak} vs {got}");
             }
@@ -577,10 +535,10 @@ mod tests {
 
     #[test]
     fn out_of_range_offset_is_not_found() {
-        let d = random_scalar();
+        let d = random_scalar().unwrap();
         let base = ProjectivePoint::GENERATOR * d;
         let baby = BabyTable::build(8, 8).unwrap();
-        let p = params(8, 16, 8);
+        let p = params(16, 8);
         let tweak = Tweak {
             t: 1 << 16,
             endo: 1,
@@ -588,14 +546,9 @@ mod tests {
         };
         let target = tweak.apply_point(&base);
         let mut reports = 0;
-        let got = recover(&base, &target, &p, &baby, &mut |_| reports += 1).unwrap();
-        assert!(got.is_none());
+        assert!(recover(&base, &target, &p, &baby, &mut |_| reports += 1).is_none());
         // A tweak from a different base key is not found either.
-        let other = ProjectivePoint::GENERATOR * random_scalar();
-        assert!(
-            recover(&other, &target, &p, &baby, &mut |_| {})
-                .unwrap()
-                .is_none()
-        );
+        let other = ProjectivePoint::GENERATOR * random_scalar().unwrap();
+        assert!(recover(&other, &target, &p, &baby, &mut |_| {}).is_none());
     }
 }

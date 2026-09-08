@@ -6,11 +6,11 @@
 use hmac::{Hmac, KeyInit, Mac};
 use k256::elliptic_curve::Group;
 use k256::elliptic_curve::PrimeField;
+use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, PublicKey, Scalar};
 use sha2::{Digest, Sha256, Sha512};
 
-use crate::pattern::Network;
-use crate::search::compressed;
+use crate::address::Network;
 
 const VERSION_XPUB: [u8; 4] = [0x04, 0x88, 0xB2, 0x1E];
 const VERSION_TPUB: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
@@ -24,16 +24,16 @@ const SCAN_ACCOUNT_CHILD: u32 = 0x8000_0001;
 
 /// The parts of a serialised extended public key that derivation needs.
 #[derive(Debug)]
-pub struct Xpub {
-    pub network: Network,
-    pub depth: u8,
-    pub child: u32,
-    pub chain_code: [u8; 32],
-    pub key: ProjectivePoint,
+struct Xpub {
+    network: Network,
+    depth: u8,
+    child: u32,
+    chain_code: [u8; 32],
+    key: ProjectivePoint,
 }
 
 /// Base58check-decodes and parses an `xpub`/`tpub`.
-pub fn parse(text: &str) -> Result<Xpub, String> {
+fn parse(text: &str) -> Result<Xpub, String> {
     let raw = bs58::decode(text.trim())
         .into_vec()
         .map_err(|e| format!("xpub: not base58: {e}"))?;
@@ -87,9 +87,9 @@ pub fn parse(text: &str) -> Result<Xpub, String> {
     })
 }
 
-/// The BIP352 scan public key `…/1'/0` of the account xpub `m/352'/coin'/account'/1'`.
-/// Rejects an xpub at any other depth or child number.
-pub fn scan_account_pubkey(xpub: &str) -> Result<([u8; 33], Network), String> {
+/// The BIP352 scan public key `…/1'/0` of the account xpub `m/352'/coin'/account'/1'`,
+/// with the xpub's network. Rejects an xpub at any other depth or child number.
+pub fn scan_account_pubkey(xpub: &str) -> Result<(ProjectivePoint, Network), String> {
     let parsed = parse(xpub)?;
     if parsed.depth != SCAN_ACCOUNT_DEPTH || parsed.child != SCAN_ACCOUNT_CHILD {
         return Err(format!(
@@ -100,7 +100,7 @@ pub fn scan_account_pubkey(xpub: &str) -> Result<([u8; 33], Network), String> {
             describe_child(parsed.child)
         ));
     }
-    derive_child(xpub, 0)
+    Ok((derive_child(&parsed, 0)?, parsed.network))
 }
 
 /// `n` or `n'` for an error message.
@@ -112,18 +112,17 @@ fn describe_child(child: u32) -> String {
     }
 }
 
-/// Non-hardened child `index` of `xpub`: `K_i = K + I_L·G` with
+/// Non-hardened child `index` of `parent`: `K_i = K + I_L·G` with
 /// `I = HMAC-SHA512(chain_code, ser_P(K) ‖ ser32(index))`.
-pub fn derive_child(xpub: &str, index: u32) -> Result<([u8; 33], Network), String> {
+fn derive_child(parent: &Xpub, index: u32) -> Result<ProjectivePoint, String> {
     if index >= 1 << 31 {
         return Err(format!(
             "xpub: child {index} is hardened; only non-hardened children can be derived from an xpub"
         ));
     }
-    let parent = parse(xpub)?;
     let mut mac = Hmac::<Sha512>::new_from_slice(&parent.chain_code)
         .map_err(|_| "xpub: internal: hmac key length".to_string())?;
-    mac.update(&compressed(&parent.key));
+    mac.update(parent.key.to_affine().to_sec1_point(true).as_bytes());
     mac.update(&index.to_be_bytes());
     let i = mac.finalize().into_bytes();
     let left: [u8; 32] = i[..32]
@@ -138,12 +137,13 @@ pub fn derive_child(xpub: &str, index: u32) -> Result<([u8; 33], Network), Strin
             "xpub: child derivation yielded the point at infinity (invalid child)".to_string(),
         );
     }
-    Ok((compressed(&child), parent.network))
+    Ok(child)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::search::compressed;
 
     // BIP32 test vector 1, m/0H/1/2H and its child m/0H/1/2H/2.
     const PARENT: &str = "xpub6D4BDPcP2GT577Vvch3R8wDkScZWzQzMMUm3PWbmWvVJrZwQY4VUNgqFJPMM3No2dFDFGTsxxpG5uJh7n7epu4trkrX7x7DogT5Uv6fcLW5";
@@ -152,18 +152,17 @@ mod tests {
 
     #[test]
     fn bip32_vector_1_child_2() {
-        let (child, network) = derive_child(PARENT, 2).unwrap();
-        assert_eq!(network, Network::Mainnet);
-        let expected = parse(CHILD).unwrap();
-        assert_eq!(child, compressed(&expected.key));
+        let parent = parse(PARENT).unwrap();
+        let child = derive_child(&parent, 2).unwrap();
+        assert_eq!(child, parse(CHILD).unwrap().key);
         assert_eq!(
-            hex::encode(child),
+            hex::encode(compressed(&child)),
             "02e8445082a72f29b75ca48748a914df60622a609cacfce8ed0e35804560741d29"
         );
     }
 
     /// The vector's parent re-serialised with other header fields.
-    pub fn reserialize(xpub: &str, version: Option<[u8; 4]>, depth: u8, child: u32) -> String {
+    fn reserialize(xpub: &str, version: Option<[u8; 4]>, depth: u8, child: u32) -> String {
         let mut raw = bs58::decode(xpub).into_vec().unwrap();
         if let Some(version) = version {
             raw[..4].copy_from_slice(&version);
@@ -194,10 +193,9 @@ mod tests {
     #[test]
     fn scan_account_path_check() {
         let good = reserialize(PARENT, None, SCAN_ACCOUNT_DEPTH, SCAN_ACCOUNT_CHILD);
-        assert_eq!(
-            scan_account_pubkey(&good).unwrap(),
-            derive_child(PARENT, 0).unwrap()
-        );
+        let (key, network) = scan_account_pubkey(&good).unwrap();
+        assert_eq!(key, derive_child(&parse(PARENT).unwrap(), 0).unwrap());
+        assert_eq!(network, Network::Mainnet);
         let err = scan_account_pubkey(PARENT).unwrap_err();
         assert!(err.contains("depth 3"), "{err}");
         assert!(err.contains("0x80000002 (2')"), "{err}");
@@ -208,7 +206,7 @@ mod tests {
         let wrong_depth = reserialize(PARENT, None, 5, SCAN_ACCOUNT_CHILD);
         assert!(scan_account_pubkey(&wrong_depth).is_err());
         // derive_child itself stays path-agnostic.
-        assert!(derive_child(&wrong_depth, 0).is_ok());
+        assert!(derive_child(&parse(&wrong_depth).unwrap(), 0).is_ok());
     }
 
     #[test]
@@ -216,10 +214,12 @@ mod tests {
         // Re-serialise the vector's parent with the tpub version bytes.
         let tpub = reserialize(PARENT, Some(VERSION_TPUB), 3, 0x8000_0002);
         assert!(tpub.starts_with("tpub"), "{tpub}");
-        assert_eq!(parse(&tpub).unwrap().network, Network::Testnet);
-        let (child, network) = derive_child(&tpub, 2).unwrap();
-        assert_eq!(network, Network::Testnet);
-        assert_eq!(child, derive_child(PARENT, 2).unwrap().0);
+        let parsed = parse(&tpub).unwrap();
+        assert_eq!(parsed.network, Network::Testnet);
+        assert_eq!(
+            derive_child(&parsed, 2).unwrap(),
+            derive_child(&parse(PARENT).unwrap(), 2).unwrap()
+        );
     }
 
     #[test]
@@ -232,7 +232,7 @@ mod tests {
         assert!(err.contains("checksum"), "{err}");
         assert!(parse("not-base58-0OIl").is_err());
         assert!(parse("xpub").is_err());
-        let err = derive_child(PARENT, 1 << 31).unwrap_err();
+        let err = derive_child(&parse(PARENT).unwrap(), 1 << 31).unwrap_err();
         assert!(err.contains("hardened"), "{err}");
     }
 }

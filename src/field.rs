@@ -32,8 +32,8 @@ impl Fe {
     ]);
 
     /// β² (the other non-trivial cube root of unity): λ²·(x, y) = (β²·x, y).
-    /// The search uses β² = −β − 1 instead.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Reference value for the tests; the search uses β² = −β − 1 instead.
+    #[cfg(test)]
     pub const BETA2: Fe = Fe([
         0x3ec6_93d6_8e6a_fa40,
         0x630f_b68a_ed0a_766a,
@@ -64,12 +64,6 @@ impl Fe {
     #[inline(always)]
     pub fn is_zero(&self) -> bool {
         (self.0[0] | self.0[1] | self.0[2] | self.0[3]) == 0
-    }
-
-    #[inline(always)]
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn is_odd(&self) -> bool {
-        self.0[0] & 1 == 1
     }
 
     /// Big-endian-most limb, i.e. the first 8 bytes of `to_bytes_be` as a `u64`.
@@ -482,7 +476,6 @@ mod tests {
             assert_eq!(a.add(&neg), Fe::ZERO);
 
             assert_eq!(a.is_zero(), ba.is_zero());
-            assert_eq!(a.is_odd(), (&ba & BigUint::one()) == BigUint::one());
         }
     }
 
