@@ -53,8 +53,8 @@ struct Cli {
     #[arg(required = true, value_name = "PATTERN")]
     patterns: Vec<String>,
 
-    /// mainnet (hrp `sp`) | testnet (hrp `tsp`, the BIP352 hrp for testnet and signet;
-    /// regtest has no standard hrp and is not supported)
+    /// mainnet (hrp `sp`) | testnet, signet (hrp `tsp`, the BIP352 hrp for both) |
+    /// regtest (hrp `sprt`)
     #[arg(short, long, value_enum, default_value_t = Network::Mainnet)]
     network: Network,
 
@@ -95,7 +95,7 @@ struct BaseKeyArgs {
     base_pubkey: Option<String>,
 
     /// split-key mode: D = child 0 (non-hardened) of this extended pubkey; give the node
-    /// m/352'/0'/0'/1' (testnet: m/352'/1'/0'/1', tpub). Mutually exclusive with -b.
+    /// m/352'/0'/0'/1' (testnet, signet, regtest: m/352'/1'/0'/1', tpub). Mutually exclusive with -b.
     #[arg(long, value_name = "XPUB")]
     xpub: Option<String>,
 }
@@ -684,22 +684,15 @@ fn parse_base_key(args: &BaseKeyArgs, network: Network) -> Result<Option<Project
     let Some(xpub) = &args.xpub else {
         return Ok(None);
     };
-    let (key, key_network) = bip32::scan_account_pubkey(xpub)?;
-    if key_network != network {
+    let (key, version) = bip32::scan_account_pubkey(xpub)?;
+    if version != bip32::Version::of(network) {
         return Err(format!(
-            "--xpub is a {} key but the search/address network is {}",
-            describe(key_network),
-            describe(network)
+            "--xpub is {} but the search/address network is {}",
+            version.describe(),
+            network.describe()
         ));
     }
     Ok(Some(key))
-}
-
-fn describe(network: Network) -> &'static str {
-    match network {
-        Network::Mainnet => "mainnet (xpub / sp1…)",
-        Network::Testnet => "testnet (tpub / tsp1…)",
-    }
 }
 
 /// A `--address` v0 silent payment address as its network and scan pubkey.
@@ -894,13 +887,16 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(point, bip32::scan_account_pubkey(ACCOUNT_XPUB).unwrap().0);
-        let err = parse_base_key(&from_xpub, Network::Testnet).unwrap_err();
-        assert!(err.contains("mainnet"), "{err}");
+        for network in [Network::Testnet, Network::Signet, Network::Regtest] {
+            let err = parse_base_key(&from_xpub, network).unwrap_err();
+            assert!(err.contains("an xpub (mainnet)"), "{err}");
+            assert!(err.contains(network.describe()), "{err}");
+        }
         let from_hex = BaseKeyArgs {
             base_pubkey: Some(hex::encode(compressed(&point))),
             xpub: None,
         };
-        let same = parse_base_key(&from_hex, Network::Testnet)
+        let same = parse_base_key(&from_hex, Network::Regtest)
             .unwrap()
             .unwrap();
         assert_eq!(same, point);
@@ -1042,6 +1038,11 @@ mod tests {
             Cli::try_parse_from(["spaghetti", "-n", "testnet", "-b", "02aa", "pasta"]).unwrap();
         assert_eq!(cli.network, Network::Testnet);
         assert_eq!(cli.base.base_pubkey.as_deref(), Some("02aa"));
+        for (name, network) in [("signet", Network::Signet), ("regtest", Network::Regtest)] {
+            let cli = Cli::try_parse_from(["spaghetti", "-n", name, "pasta"]).unwrap();
+            assert_eq!(cli.network, network);
+        }
+        assert!(Cli::try_parse_from(["spaghetti", "-n", "testnet4", "pasta"]).is_err());
         assert!(Cli::try_parse_from(["spaghetti", "-b", "02aa", "--xpub", "x", "pasta"]).is_err());
         assert!(Cli::try_parse_from(["spaghetti"]).is_err());
         let cli =

@@ -17,7 +17,8 @@ or clone and `cargo build --release` (binary in `target/release/spaghetti`). `RU
 ```
 spaghetti pasta                 # sp1qq?pasta…  (? = any of the 8 allowed 6th chars)
 spaghetti sp1qqgpasta           # fixed 6th char: forces an even-y scan key
-spaghetti -n testnet pasta      # tsp1qq?pasta… (testnet and signet)
+spaghetti -n signet pasta       # tsp1qq?pasta… (same as -n testnet: BIP352 gives both the hrp tsp)
+spaghetti -n regtest pasta      # sprt1qq?pasta…
 spaghetti -k 3 pasta penne      # any-of, stop after 3 matches
 spaghetti -s 02…33-byte-hex pasta   # render the example address with a real spend key
 spaghetti -b 02…33-byte-hex pasta   # split-key mode: seed-recoverable key (see below)
@@ -31,14 +32,14 @@ spaghetti apply --scan-priv-file d.hex --tweak 48213946821/1/-   # wallet scan k
 spaghetti [OPTIONS] <PATTERN>...
 
   <PATTERN>...  address prefix, full (sp1qq?pasta) or bare (pasta = sp1qq?pasta); ? = any char
-  -n, --network <NETWORK>      mainnet (hrp sp) | testnet (hrp tsp: the BIP352 hrp for testnet and signet;
-                               regtest has no standard hrp and is not supported) [default: mainnet]
+  -n, --network <NETWORK>      mainnet (hrp sp) | testnet, signet (hrp tsp, the BIP352 hrp for both) |
+                               regtest (hrp sprt) [default: mainnet]
   -c, --cores <N>              OS threads, at most 1024 [default: available_parallelism]
   -k, --count <N>              stop after N matches [default: 1]
   -s, --spend-pubkey <HEX33>   spend public key used to render the example address (random throwaway one if omitted)
   -b, --base-pubkey <HEX33>    split-key mode: search offsets from this compressed scan pubkey D
       --xpub <XPUB>            split-key mode: D = child 0 (non-hardened) of this extended pubkey (xpub or tpub);
-                               give the node m/352'/0'/0'/1' (testnet: m/352'/1'/0'/1'). Mutually exclusive with -b.
+                               give the node m/352'/0'/0'/1' (testnet, signet, regtest: m/352'/1'/0'/1', tpub). Mutually exclusive with -b.
       --output <PATH>          write each match, secret included, to this new file (mode 0600, never
                                overwritten) and print it without the secret line; random mode only
   -q, --quiet                  no progress output
@@ -97,11 +98,11 @@ For each of the six `(e, s)` variants it solves `s·λ^{-e}·B − D = t·G` for
 
 **Labels caveat.** BIP352 label tweaks are `hash(ser_256(b_scan) ‖ ser_32(m))`, so labeled spend keys, and the change label `m = 0`, depend on the scan key. Everything must be derived from the vanity scan key, and the switch has to happen before the first address is issued: addresses (and their labels) handed out under the original `d` are not detectable with the vanity key.
 
-**Obtaining `D`.** Export the extended public key of `m/352'/0'/0'/1'` (`m/352'/1'/0'/1'` for testnet, a `tpub`) and pass it with `--xpub`: `spaghetti` checks that the xpub sits at that node (depth 4, last child `1'`) and derives child 0 itself (plain BIP32, HMAC-SHA512). Or pass the compressed public key of `m/352'/0'/0'/1'/0` directly with `-b`. Both `recover` and the search accept either form; the network must match (`-n` for the search, the address hrp for `recover`).
+**Obtaining `D`.** Export the extended public key of `m/352'/0'/0'/1'` (`m/352'/1'/0'/1'` on testnet, signet and regtest, a `tpub`) and pass it with `--xpub`: `spaghetti` checks that the xpub sits at that node (depth 4, last child `1'`) and derives child 0 itself (plain BIP32, HMAC-SHA512). Or pass the compressed public key of `m/352'/0'/0'/1'/0` directly with `-b`. Both `recover` and the search accept either form; the network must match (`-n` for the search, the address hrp for `recover`): an `xpub` goes with mainnet, a `tpub` with any test network.
 
 ## What can be chosen
 
-Every v0 address starts with `sp1qq` (`tsp1qq` on testnet and signet): `sp` is the hrp, `1` the separator, the first `q` is the version, and the second `q` encodes the five zero bits at the top of the SEC1 tag byte (`0x02`/`0x03`). BIP352 defines only the hrps `sp` (mainnet) and `tsp` (testnets); regtest hrps such as `sprt` are implementation-defined and not supported.
+Every v0 address starts with `sp1qq` (`tsp1qq` on testnet and signet, `sprt1qq` on regtest): `sp` is the hrp, `1` the separator, the first `q` is the version, and the second `q` encodes the five zero bits at the top of the SEC1 tag byte (`0x02`/`0x03`). BIP352 defines only the hrps `sp` (mainnet) and `tsp` (testnets); for regtest, which it does not name, `spaghetti` uses `sprt`, the hrp of existing implementations (e.g. [rust-silentpayments](https://github.com/cygnet3/rust-silentpayments)). Testnet and signet addresses are identical, and a regtest wallet that expects `tsp` can use `-n testnet`: the key, the `tpub` and the coin type (`1'`) are the same on every test network, only the hrp differs. Positions below are counted as on mainnet: the "6th char" is the one after `sp1qq`, `tsp1qq` or `sprt1qq`.
 
 The 6th character encodes the tag's last two bits (`1` + y parity) and the top two bits of the x coordinate, so only 8 values are possible:
 

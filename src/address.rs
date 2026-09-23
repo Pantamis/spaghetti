@@ -6,27 +6,51 @@ use bech32::primitives::decode::CheckedHrpstring;
 use bech32::{Bech32m, ByteIterExt, Fe32, Fe32IterExt, Hrp};
 use clap::ValueEnum;
 
-/// BIP352 defines two hrps; regtest has no standard one and is not supported.
+/// BIP352 defines the hrps `sp` (mainnet) and `tsp` (testnets); regtest uses
+/// `sprt`, the hrp of the silent payment implementations that support it
+/// (the BIP does not name one).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, ValueEnum)]
 pub enum Network {
     /// hrp `sp`
     Mainnet,
-    /// hrp `tsp` (BIP352: testnet and signet)
+    /// hrp `tsp`
     Testnet,
+    /// hrp `tsp` (the BIP352 testnet hrp): same addresses and keys as testnet
+    Signet,
+    /// hrp `sprt`
+    Regtest,
 }
 
 impl Network {
     pub fn hrp(self) -> Hrp {
         match self {
             Network::Mainnet => Hrp::parse_unchecked("sp"),
-            Network::Testnet => Hrp::parse_unchecked("tsp"),
+            Network::Testnet | Network::Signet => Hrp::parse_unchecked("tsp"),
+            Network::Regtest => Hrp::parse_unchecked("sprt"),
         }
     }
 
+    /// Whether wallets of this network export `tpub`s and derive with coin
+    /// type `1'`: every network but mainnet.
+    pub fn is_test(self) -> bool {
+        self != Network::Mainnet
+    }
+
+    /// The network of a decoded hrp. `tsp` is shared by testnet and signet
+    /// and decodes as [`Network::Testnet`]; an address cannot tell them apart.
     fn from_hrp(hrp: Hrp) -> Option<Network> {
-        [Network::Mainnet, Network::Testnet]
+        [Network::Mainnet, Network::Testnet, Network::Regtest]
             .into_iter()
             .find(|network| network.hrp() == hrp)
+    }
+
+    /// For messages: the network name(s) of this network's hrp and its xpub kind.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Network::Mainnet => "mainnet (sp1…, xpub)",
+            Network::Testnet | Network::Signet => "testnet/signet (tsp1…, tpub)",
+            Network::Regtest => "regtest (sprt1…, tpub)",
+        }
     }
 }
 
@@ -44,7 +68,8 @@ pub fn encode(hrp: Hrp, scan: &[u8; 33], spend: &[u8; 33]) -> String {
 
 /// Strictly decodes a v0 silent payment address into `(network, scan, spend)`:
 /// bech32m, version `q`, exactly 66 payload bytes, zero padding bits (the
-/// re-encoded keys must reproduce the input) and a BIP352 hrp.
+/// re-encoded keys must reproduce the input) and an hrp of [`Network`]
+/// (`tsp` decodes as testnet, see [`Network::from_hrp`]).
 pub fn decode(address: &str) -> Result<(Network, [u8; 33], [u8; 33]), String> {
     let mut parsed = CheckedHrpstring::new::<Bech32m>(address).map_err(|e| e.to_string())?;
     let version = parsed
@@ -68,8 +93,9 @@ pub fn decode(address: &str) -> Result<(Network, [u8; 33], [u8; 33]), String> {
     if encode(hrp, &scan, &spend) != address.to_ascii_lowercase() {
         return Err("address has non-zero padding bits".to_string());
     }
-    let network = Network::from_hrp(hrp)
-        .ok_or_else(|| format!("hrp '{hrp}' is neither sp (mainnet) nor tsp (testnet/signet)"))?;
+    let network = Network::from_hrp(hrp).ok_or_else(|| {
+        format!("hrp '{hrp}' is not sp (mainnet), tsp (testnet/signet) or sprt (regtest)")
+    })?;
     Ok((network, scan, spend))
 }
 
@@ -136,6 +162,27 @@ mod tests {
         let (network, got_scan, _) = decode(&address).unwrap();
         assert_eq!(network, Network::Testnet);
         assert_eq!(got_scan, scan);
+    }
+
+    #[test]
+    fn signet_and_regtest_hrps() {
+        let scan = compressed(VECTOR_SCAN);
+        let spend = compressed(VECTOR_SPEND);
+        let signet = encode(Network::Signet.hrp(), &scan, &spend);
+        assert_eq!(signet, encode(Network::Testnet.hrp(), &scan, &spend));
+        // Testnet and signet share an hrp: a signet address decodes as testnet.
+        assert_eq!(decode(&signet).unwrap().0, Network::Testnet);
+        let regtest = encode(Network::Regtest.hrp(), &scan, &spend);
+        assert!(regtest.starts_with("sprt1qq"), "{regtest}");
+        assert_eq!(regtest.len(), VECTOR_ADDRESS.len() + 2);
+        let (network, got_scan, got_spend) = decode(&regtest).unwrap();
+        assert_eq!(network, Network::Regtest);
+        assert_eq!((got_scan, got_spend), (scan, spend));
+        assert!(decode(&regtest.to_uppercase()).is_ok());
+        // Only the mainnet network uses xpubs.
+        assert!(!Network::Mainnet.is_test());
+        assert!(Network::Testnet.is_test() && Network::Signet.is_test());
+        assert!(Network::Regtest.is_test());
     }
 
     #[test]

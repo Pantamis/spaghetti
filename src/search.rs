@@ -813,6 +813,9 @@ mod tests {
             ("sp1qqgp", Network::Mainnet),
             ("sp1qqvz", Network::Mainnet),
             ("tsp1qq?r", Network::Testnet),
+            ("tsp1qqwy", Network::Signet),
+            ("sprt1qq?s", Network::Regtest),
+            ("sprt1qqf9", Network::Regtest),
         ] {
             let patterns = PatternSet::parse(&[input.to_string()], network).unwrap();
             let mut walk = Walk::random(&table).unwrap();
@@ -835,7 +838,8 @@ mod tests {
                     "{input}: {addr}"
                 );
                 let (got_network, scan, got_spend) = address::decode(&addr).unwrap();
-                assert_eq!(got_network, network);
+                // Signet shares testnet's hrp and decodes as testnet.
+                assert_eq!(got_network.hrp(), network.hrp());
                 assert_eq!(scan, pubkey);
                 assert_eq!(got_spend, spend);
             }
