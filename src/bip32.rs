@@ -17,6 +17,33 @@ const VERSION_TPUB: [u8; 4] = [0x04, 0x35, 0x87, 0xCF];
 const VERSION_XPRV: [u8; 4] = [0x04, 0x88, 0xAD, 0xE4];
 const VERSION_TPRV: [u8; 4] = [0x04, 0x35, 0x83, 0x94];
 
+/// The version of an extended public key: `xpub` on mainnet, `tpub` on every
+/// test network (testnet, signet and regtest share it and coin type `1'`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Version {
+    Xpub,
+    Tpub,
+}
+
+impl Version {
+    /// The version wallets of `network` export.
+    pub fn of(network: Network) -> Version {
+        if network.is_test() {
+            Version::Tpub
+        } else {
+            Version::Xpub
+        }
+    }
+
+    /// For messages.
+    pub fn describe(self) -> &'static str {
+        match self {
+            Version::Xpub => "an xpub (mainnet)",
+            Version::Tpub => "a tpub (testnet, signet or regtest)",
+        }
+    }
+}
+
 /// Depth of `m/352'/coin'/account'/1'`.
 const SCAN_ACCOUNT_DEPTH: u8 = 4;
 /// Child number of the last step, `1'`.
@@ -25,7 +52,7 @@ const SCAN_ACCOUNT_CHILD: u32 = 0x8000_0001;
 /// The parts of a serialised extended public key that derivation needs.
 #[derive(Debug)]
 struct Xpub {
-    network: Network,
+    version: Version,
     depth: u8,
     child: u32,
     chain_code: [u8; 32],
@@ -51,9 +78,9 @@ fn parse(text: &str) -> Result<Xpub, String> {
     let version: [u8; 4] = payload[..4]
         .try_into()
         .map_err(|_| "xpub: internal: version slice")?;
-    let network = match version {
-        VERSION_XPUB => Network::Mainnet,
-        VERSION_TPUB => Network::Testnet,
+    let version = match version {
+        VERSION_XPUB => Version::Xpub,
+        VERSION_TPUB => Version::Tpub,
         VERSION_XPRV | VERSION_TPRV => {
             return Err(
                 "xpub: this is an extended *private* key; export the xpub instead".to_string(),
@@ -79,7 +106,7 @@ fn parse(text: &str) -> Result<Xpub, String> {
         .map_err(|_| "xpub: key bytes are not a valid compressed secp256k1 point".to_string())?
         .to_projective();
     Ok(Xpub {
-        network,
+        version,
         depth,
         child,
         chain_code,
@@ -88,8 +115,8 @@ fn parse(text: &str) -> Result<Xpub, String> {
 }
 
 /// The BIP352 scan public key `…/1'/0` of the account xpub `m/352'/coin'/account'/1'`,
-/// with the xpub's network. Rejects an xpub at any other depth or child number.
-pub fn scan_account_pubkey(xpub: &str) -> Result<(ProjectivePoint, Network), String> {
+/// with the xpub's version. Rejects an xpub at any other depth or child number.
+pub fn scan_account_pubkey(xpub: &str) -> Result<(ProjectivePoint, Version), String> {
     let parsed = parse(xpub)?;
     if parsed.depth != SCAN_ACCOUNT_DEPTH || parsed.child != SCAN_ACCOUNT_CHILD {
         return Err(format!(
@@ -100,7 +127,7 @@ pub fn scan_account_pubkey(xpub: &str) -> Result<(ProjectivePoint, Network), Str
             describe_child(parsed.child)
         ));
     }
-    Ok((derive_child(&parsed, 0)?, parsed.network))
+    Ok((derive_child(&parsed, 0)?, parsed.version))
 }
 
 /// `n` or `n'` for an error message.
@@ -177,7 +204,7 @@ mod tests {
     #[test]
     fn parse_fields() {
         let parent = parse(PARENT).unwrap();
-        assert_eq!(parent.network, Network::Mainnet);
+        assert_eq!(parent.version, Version::Xpub);
         assert_eq!(parent.depth, 3);
         assert_eq!(parent.child, 0x8000_0002);
         assert_eq!(
@@ -193,9 +220,9 @@ mod tests {
     #[test]
     fn scan_account_path_check() {
         let good = reserialize(PARENT, None, SCAN_ACCOUNT_DEPTH, SCAN_ACCOUNT_CHILD);
-        let (key, network) = scan_account_pubkey(&good).unwrap();
+        let (key, version) = scan_account_pubkey(&good).unwrap();
         assert_eq!(key, derive_child(&parse(PARENT).unwrap(), 0).unwrap());
-        assert_eq!(network, Network::Mainnet);
+        assert_eq!(version, Version::Xpub);
         let err = scan_account_pubkey(PARENT).unwrap_err();
         assert!(err.contains("depth 3"), "{err}");
         assert!(err.contains("0x80000002 (2')"), "{err}");
@@ -215,11 +242,19 @@ mod tests {
         let tpub = reserialize(PARENT, Some(VERSION_TPUB), 3, 0x8000_0002);
         assert!(tpub.starts_with("tpub"), "{tpub}");
         let parsed = parse(&tpub).unwrap();
-        assert_eq!(parsed.network, Network::Testnet);
+        assert_eq!(parsed.version, Version::Tpub);
         assert_eq!(
             derive_child(&parsed, 2).unwrap(),
             derive_child(&parse(PARENT).unwrap(), 2).unwrap()
         );
+    }
+
+    #[test]
+    fn version_of_network() {
+        assert_eq!(Version::of(Network::Mainnet), Version::Xpub);
+        for network in [Network::Testnet, Network::Signet, Network::Regtest] {
+            assert_eq!(Version::of(network), Version::Tpub);
+        }
     }
 
     #[test]

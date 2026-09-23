@@ -206,6 +206,90 @@ fn xpub_base_key_and_network_check() {
 }
 
 #[test]
+fn regtest_and_signet_with_tpub() {
+    // The xpub of xpub_base_key_and_network_check re-serialised with the tpub
+    // version bytes: the node m/352'/1'/0'/1' of a testnet/signet/regtest wallet.
+    const TPUB: &str = "tpubDFJwbQx5wr5XC8VGZujBeTFVdD1awdm92UDrdPj5kR8jShL2Jqrjw1NV1krPKcdoiwoCyWB2qyfQEMiUaR94edJNngcXsoPCFaa7DckCpRJ";
+    const XPUB: &str = "xpub6EwK5B8QEa84vLJR7ik6SXv8J5uvxFG5UqdZGqfwQWNqhQfKEd1enZhemimbo7gZw3GJMvfAJsqMYBDsBZHpmBr5j5sECGixfcyhTb4B9jY";
+    let search = |network: &str| {
+        let (ok, out, err) = spaghetti(&[
+            "-q", "-n", network, "-c", "1", "--batch", "64", "--xpub", TPUB, "pa",
+        ]);
+        assert!(ok, "{err}");
+        fields(&out)
+    };
+    let regtest = search("regtest");
+    let address = &regtest["address"];
+    assert!(
+        address.starts_with("sprt1qq") && address[8..].starts_with("pa"),
+        "{address}"
+    );
+    // Same tpub and deterministic single-thread walk: the key is the same on
+    // every test network, only the hrp differs (the spend key is random).
+    let signet = search("signet");
+    assert!(
+        signet["address"].starts_with("tsp1qq"),
+        "{}",
+        signet["address"]
+    );
+    for other in [&signet, &search("testnet")] {
+        assert_eq!(other["base scan pubkey"], regtest["base scan pubkey"]);
+        assert_eq!(other["vanity scan pubkey"], regtest["vanity scan pubkey"]);
+        assert_eq!(other["tweak"], regtest["tweak"]);
+    }
+
+    // recover takes the network from the sprt1 address.
+    let (ok, out, err) = spaghetti(&[
+        "recover",
+        "--address",
+        address,
+        "--xpub",
+        TPUB,
+        "--baby-bits",
+        "12",
+    ]);
+    assert!(ok, "{err}");
+    let recovered = fields(&out);
+    assert_eq!(
+        recovered["vanity scan pubkey"],
+        regtest["vanity scan pubkey"]
+    );
+    assert_eq!(recovered["tweak"], regtest["tweak"]);
+
+    // A mainnet xpub does not fit a regtest search or address, nor a tpub mainnet.
+    let (ok, _, err) = spaghetti(&["-q", "-n", "regtest", "--xpub", XPUB, "pa"]);
+    assert!(!ok);
+    assert!(
+        err.contains("xpub (mainnet)") && err.contains("regtest"),
+        "{err}"
+    );
+    let (ok, _, err) = spaghetti(&["recover", "--address", address, "--xpub", XPUB]);
+    assert!(!ok);
+    assert!(err.contains("regtest (sprt1"), "{err}");
+    let (ok, _, err) = spaghetti(&["-q", "--xpub", TPUB, "pa"]);
+    assert!(!ok);
+    assert!(err.contains("tpub") && err.contains("mainnet"), "{err}");
+
+    // apply checks a regtest address like any other.
+    let (ok, out, err) = spaghetti(&["-q", "-n", "regtest", "--batch", "64", "sprt1qq?pa"]);
+    assert!(ok, "{err}");
+    let random = fields(&out);
+    let (ok, out, err) = apply(
+        &random["scan secret key"],
+        &["--tweak", "0/0/+", "--address", &random["address"]],
+    );
+    assert!(ok, "{err}");
+    assert_eq!(
+        fields(&out)["vanity scan public key"],
+        random["scan public key"]
+    );
+    // A wrong-network pattern is rejected with a hint.
+    let (ok, _, err) = spaghetti(&["-q", "-n", "regtest", "tsp1qq?pa"]);
+    assert!(!ok);
+    assert!(err.contains("-n signet"), "{err}");
+}
+
+#[test]
 fn cli_limits_and_error_prefixes() {
     let (ok, _, err) = spaghetti(&["-q", "-c", "1025", "pa"]);
     assert!(!ok);

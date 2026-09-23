@@ -55,7 +55,8 @@ impl Pattern {
             if given_hrp != hrp {
                 let hint = match given_hrp {
                     "sp" => " (use -n mainnet)",
-                    "tsp" => " (use -n testnet)",
+                    "tsp" => " (use -n testnet or -n signet)",
+                    "sprt" => " (use -n regtest)",
                     _ => "",
                 };
                 return Err(format!(
@@ -277,6 +278,9 @@ mod tests {
         assert_eq!(p.bits, 15);
         let t = Pattern::parse("pas", Network::Testnet).unwrap();
         assert_eq!(t.text, "tsp1qq?pas");
+        assert_eq!(Pattern::parse("pas", Network::Signet).unwrap(), t);
+        let r = Pattern::parse("pas", Network::Regtest).unwrap();
+        assert_eq!(r.text, "sprt1qq?pas");
         assert_eq!(Pattern::parse("PAS", Network::Mainnet).unwrap(), p);
     }
 
@@ -292,6 +296,9 @@ mod tests {
         assert_eq!(wild, Pattern::parse("pas", Network::Mainnet).unwrap());
         let t = Pattern::parse("tsp1qqgpas", Network::Testnet).unwrap();
         assert_eq!(t.text, "tsp1qqgpas");
+        let r = Pattern::parse("sprt1qqgpas", Network::Regtest).unwrap();
+        assert_eq!(r.text, "sprt1qqgpas");
+        assert_eq!((r.parity, r.bits), (even.parity, even.bits));
     }
 
     #[test]
@@ -348,6 +355,10 @@ mod tests {
         assert!(err.contains("-n testnet"), "{err}");
         let err = Pattern::parse("sp1qq?pas", Network::Testnet).unwrap_err();
         assert!(err.contains("-n mainnet"), "{err}");
+        let err = Pattern::parse("sprt1qq?pas", Network::Testnet).unwrap_err();
+        assert!(err.contains("-n regtest"), "{err}");
+        let err = Pattern::parse("tsp1qq?pas", Network::Regtest).unwrap_err();
+        assert!(err.contains("-n signet"), "{err}");
         let err = Pattern::parse("bc1qq?pas", Network::Mainnet).unwrap_err();
         assert!(err.contains("does not match"), "{err}");
     }
@@ -385,11 +396,20 @@ mod tests {
             let x: [u8; 32] = scan[1..].try_into().unwrap();
             let odd = scan[0] == 0x03;
             let addr = address::encode(Network::Mainnet.hrp(), &scan, &spend);
+            let regtest = address::encode(Network::Regtest.hrp(), &scan, &spend);
             for len in 5..=56 {
                 let prefix = &addr[..len];
                 let fixed = Pattern::parse(prefix, Network::Mainnet).unwrap();
                 assert!(fixed.matches_bytes(&x), "{prefix} vs {addr}");
                 assert!(fixed.matches_address(&addr));
+                // The longer regtest hrp shifts the text, not the key bits.
+                let r = Pattern::parse(&regtest[..len + 2], Network::Regtest).unwrap();
+                assert_eq!(
+                    (r.mask, r.value, r.parity, r.bits),
+                    (fixed.mask, fixed.value, fixed.parity, fixed.bits)
+                );
+                assert!(r.matches_address(&regtest));
+                assert!(!r.matches_address(&addr));
                 if len >= 6 {
                     assert_eq!(fixed.parity, Some(odd));
                     let mut wild = prefix.to_string();
