@@ -80,6 +80,19 @@ impl Fe {
         self.0[3]
     }
 
+    /// The four little-endian 64-bit limbs.
+    #[cfg(any(feature = "gpu", test))]
+    pub fn limbs(&self) -> [u64; 4] {
+        self.0
+    }
+
+    /// From little-endian limbs; `None` unless the value is canonical (`< p`).
+    #[cfg(any(feature = "gpu", test))]
+    pub fn from_limbs(limbs: [u64; 4]) -> Option<Fe> {
+        let (_, carry) = add_c(&limbs);
+        (!carry).then_some(Fe(limbs))
+    }
+
     /// `self.neg().top_limb()` for a non-zero `self`, without the other limbs:
     /// `p − s` borrows into the top limb exactly when the low 192 bits of `s`
     /// exceed those of `p` (all ones above `P[0]`).
@@ -561,6 +574,20 @@ mod tests {
             }
             assert_eq!(s.neg_top_limb(), s.neg().top_limb(), "{s:?}");
         }
+    }
+
+    #[test]
+    fn limbs_round_trip_and_reject_non_canonical() {
+        let mut rng = Rng(0x1234_5678_9abc_def0);
+        for fe in edge_cases().into_iter().chain((0..100).map(|_| rng.fe())) {
+            assert_eq!(Fe::from_limbs(fe.limbs()), Some(fe));
+        }
+        assert_eq!(Fe::from_limbs(P), None);
+        assert_eq!(Fe::from_limbs([u64::MAX; 4]), None);
+        assert_eq!(
+            Fe::from_limbs([P[0] - 1, P[1], P[2], P[3]]),
+            Some(Fe::ZERO.sub(&Fe::ONE))
+        );
     }
 
     fn check_canonical(fe: &Fe) {

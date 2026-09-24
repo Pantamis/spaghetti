@@ -94,6 +94,18 @@ impl Table {
         2 * self.half as u64 + 1
     }
 
+    /// Affine `(x, y)` of `(j+1)·P` for `j < H`.
+    #[cfg(feature = "gpu")]
+    pub fn point(&self, j: usize) -> (Fe, Fe) {
+        (self.x[j], self.y[j])
+    }
+
+    /// Affine `(x, y)` of the jump `(2H+1)·P`.
+    #[cfg(feature = "gpu")]
+    pub fn jump(&self) -> (Fe, Fe) {
+        (self.jump_x, self.jump_y)
+    }
+
     /// x candidates produced per batch (`x`, `βx`, `β²x` for `2H+1` points).
     fn candidates_per_batch(&self) -> u64 {
         3 * self.step()
@@ -449,6 +461,30 @@ fn push_candidate<'p>(
     }
 }
 
+/// Resolves a hit reported by another engine (the GPU): `x` is the claimed x
+/// coordinate of `λ^endo · (k0 + offset) · G` (plus the split-mode base).
+/// `None` when no pattern matches `x` in full; otherwise the same
+/// reconstruction and k256 cross-check as a CPU hit ([`resolve`]).
+#[cfg(feature = "gpu")]
+pub fn resolve_hit(
+    k0: &Scalar,
+    offset: i64,
+    endo: u8,
+    x: Fe,
+    patterns: &PatternSet,
+    mode: &Mode,
+) -> Option<Result<Found, String>> {
+    let pattern = patterns.find(&x)?;
+    let candidate = Candidate {
+        k0: Zeroizing::new(*k0),
+        offset,
+        endo,
+        x,
+        pattern,
+    };
+    Some(resolve(&candidate, mode))
+}
+
 /// How candidate scalars map to points: `k·G` (random start) or
 /// `D + t·G` (split-key mode, `t` small).
 #[derive(Clone, Copy, Debug)]
@@ -601,6 +637,17 @@ impl Shared {
     pub fn tested(&self) -> u64 {
         self.tested.iter().map(Counter::get).sum()
     }
+
+    /// The progress counter of worker `index`.
+    pub fn counter(&self, index: usize) -> &Counter {
+        &self.tested[index]
+    }
+
+    /// Split mode: takes the next range from the queue (`>= SPLIT_RANGES`
+    /// once they are all handed out).
+    pub fn next_range(&self) -> usize {
+        self.next_range.fetch_add(1, Ordering::Relaxed)
+    }
 }
 
 /// Body of one worker thread. Every hit (or error) goes to `sender`; the
@@ -621,7 +668,7 @@ pub fn worker(
     shared: &Shared,
     sender: &mpsc::Sender<Result<Found, String>>,
 ) {
-    let tested = &shared.tested[index];
+    let tested = shared.counter(index);
     // Monomorphise the batch loop on the pattern count (see `Keys`).
     match patterns.keys.as_slice() {
         &[a] => run(table, patterns, [a], mode, shared, tested, sender),
@@ -670,7 +717,7 @@ fn run<K: Keys>(
             }
         }
         Mode::Split { base } => loop {
-            let range = shared.next_range.fetch_add(1, Ordering::Relaxed);
+            let range = shared.next_range();
             if range >= SPLIT_RANGES || shared.stop.load(Ordering::Relaxed) {
                 return;
             }

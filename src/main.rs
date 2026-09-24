@@ -7,6 +7,8 @@
 mod address;
 mod bip32;
 mod field;
+#[cfg(feature = "gpu")]
+mod gpu;
 mod pattern;
 mod recover;
 mod search;
@@ -85,6 +87,41 @@ struct Cli {
     /// half-batch size H (2H points per inversion)
     #[arg(long, value_name = "N", default_value_t = 4096, hide = true)]
     batch: usize,
+
+    /// search on the GPU (Apple Metal); CPU worker threads are then only spawned
+    /// with an explicit -c
+    #[cfg(feature = "gpu")]
+    #[arg(long)]
+    gpu: bool,
+
+    /// GPU walks (threads), a power of two
+    #[cfg(feature = "gpu")]
+    #[arg(long, value_name = "N", default_value_t = gpu::DEFAULT_THREADS, hide = true, requires = "gpu")]
+    gpu_threads: usize,
+
+    /// GPU half-batch size H (2H points per inversion per walk)
+    #[cfg(feature = "gpu")]
+    #[arg(long, value_name = "N", default_value_t = gpu::DEFAULT_HALF, hide = true, requires = "gpu")]
+    gpu_batch: usize,
+}
+
+/// The GPU configuration requested on the command line, validated.
+#[cfg(feature = "gpu")]
+fn gpu_config(cli: &Cli) -> Result<Option<gpu::Config>, String> {
+    if !cli.gpu {
+        return Ok(None);
+    }
+    let cfg = gpu::Config {
+        threads: cli.gpu_threads,
+        half: cli.gpu_batch,
+    };
+    cfg.check()?;
+    Ok(Some(cfg))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn gpu_config(_cli: &Cli) -> Result<Option<()>, String> {
+    Ok(None)
 }
 
 /// Where the base scan public key `D` of split-key mode comes from.
@@ -176,7 +213,10 @@ struct Search {
     network: Network,
     mode: Mode,
     table: Table,
+    /// CPU worker threads (0 when only the GPU searches).
     threads: usize,
+    #[cfg(feature = "gpu")]
+    gpu: Option<gpu::Config>,
     count: u64,
     spend: [u8; 33],
     spend_provided: bool,
@@ -192,7 +232,14 @@ impl Search {
             Some(text) => parse_pubkey(text, "--spend-pubkey")?,
             None => ProjectivePoint::GENERATOR * search::random_scalar()?,
         };
-        let cores = thread_count(cli.cores)?;
+        let gpu = gpu_config(&cli)?;
+        // With the GPU, CPU workers are opt-in (`-c`): the host thread that
+        // drives the GPU should not compete with them.
+        let cores = if gpu.is_some() && cli.cores.is_none() {
+            0
+        } else {
+            thread_count(cli.cores)?
+        };
         check_batch(cli.batch)?;
         if cli.count == 0 {
             return Err("--count must be at least 1".to_string());
@@ -219,6 +266,8 @@ impl Search {
             mode,
             table: Table::new(cli.batch, ProjectivePoint::GENERATOR),
             threads,
+            #[cfg(feature = "gpu")]
+            gpu,
             count: cli.count,
             spend: compressed(&spend),
             spend_provided: cli.spend_pubkey.is_some(),
@@ -231,6 +280,46 @@ impl Search {
         self.patterns.expected_candidates()
     }
 
+    #[cfg(feature = "gpu")]
+    fn gpu(&self) -> Option<&gpu::Config> {
+        self.gpu.as_ref()
+    }
+
+    #[cfg(not(feature = "gpu"))]
+    fn gpu(&self) -> Option<&()> {
+        None
+    }
+
+    /// Workers in total: CPU threads plus the GPU driver.
+    fn workers(&self) -> usize {
+        self.threads + usize::from(self.gpu().is_some())
+    }
+
+    /// Start-up banner part describing the GPU, when used.
+    fn gpu_banner(&self) -> String {
+        #[cfg(feature = "gpu")]
+        if let Some(cfg) = self.gpu() {
+            let name = gpu::device_name().unwrap_or_else(|e| e);
+            return format!(
+                " | GPU {name}: {} walks, batch {}",
+                cfg.threads,
+                2 * cfg.half
+            );
+        }
+        String::new()
+    }
+
+    /// x candidates a full split-mode search can visit, over every engine.
+    fn split_coverage(&self) -> f64 {
+        let cpu = search::split_coverage(self.table.half);
+        #[cfg(feature = "gpu")]
+        if let Some(cfg) = self.gpu() {
+            let gpu = gpu::split_coverage(cfg);
+            return if self.threads > 0 { cpu.min(gpu) } else { gpu };
+        }
+        cpu
+    }
+
     fn announce(&self) {
         let names: Vec<&str> = self
             .patterns
@@ -239,7 +328,7 @@ impl Search {
             .map(|p| p.text.as_str())
             .collect();
         eprintln!(
-            "searching {} | difficulty 2^{} ≈ {} candidates | {} threads, batch {}{}",
+            "searching {} | difficulty 2^{} ≈ {} candidates | {} threads, batch {}{}{}",
             names.join(" | "),
             self.patterns
                 .patterns
@@ -250,6 +339,7 @@ impl Search {
             human_count(self.expected()),
             self.threads,
             2 * self.table.half,
+            self.gpu_banner(),
             if matches!(self.mode, Mode::Split { .. }) {
                 format!(" | split-key mode ({SPLIT_RANGES} ranges of 2^{RANGE_BITS} offsets)")
             } else {
@@ -258,7 +348,7 @@ impl Search {
         );
         // Split-key mode covers every offset below 2^52 whatever the thread
         // count: warn when the pattern is expected to need more than a quarter.
-        let coverage = search::split_coverage(self.table.half);
+        let coverage = self.split_coverage();
         if matches!(self.mode, Mode::Split { .. }) && self.expected() * 4.0 > coverage {
             eprintln!(
                 "warning: split-key mode covers at most ≈ {} candidates (every offset below \
@@ -279,7 +369,7 @@ impl Search {
         if !self.quiet {
             self.announce();
         }
-        let shared = Shared::new(self.threads);
+        let shared = Shared::new(self.workers());
         let (sender, receiver) = mpsc::channel();
         let started = Instant::now();
         let mut result = Ok(());
@@ -299,6 +389,13 @@ impl Search {
                     ));
                     break;
                 }
+            }
+            #[cfg(feature = "gpu")]
+            if let Some(cfg) = self.gpu() {
+                let sender = sender.clone();
+                let (patterns, mode, shared, index) =
+                    (&self.patterns, &self.mode, &shared, self.threads);
+                scope.spawn(move || gpu::worker(index, cfg, patterns, mode, shared, &sender));
             }
             drop(sender);
             if result.is_ok() {

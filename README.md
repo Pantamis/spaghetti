@@ -12,6 +12,8 @@ cargo install --git https://github.com/louneskmt/spaghetti
 
 or clone and `cargo build --release` (binary in `target/release/spaghetti`). `RUSTFLAGS="-C target-cpu=native"` made no measurable difference on an Apple M2; it may help on other CPUs.
 
+On Apple silicon, `cargo build --release --features gpu` adds the Metal GPU search (`--gpu`, see [Difficulty](#difficulty)); it needs macOS but no Xcode, the shader is compiled by the Metal framework when the program starts.
+
 ## Usage
 
 ```
@@ -24,6 +26,7 @@ spaghetti -s 02…33-byte-hex pasta   # render the example address with a real s
 spaghetti -b 02…33-byte-hex pasta   # split-key mode: seed-recoverable key (see below)
 spaghetti --xpub xpub6… pasta       # same, base key from the xpub of m/352'/0'/0'/1'
 spaghetti --output key.txt pasta    # secret goes to a new 0600 file, not to the terminal
+spaghetti --gpu farfalle            # search on the GPU (build with --features gpu; --gpu -c 8 adds 8 CPU threads)
 spaghetti recover --address sp1qq… -b 02…   # find the tweak of a published address
 spaghetti apply --scan-priv-file d.hex --tweak 48213946821/1/-   # wallet scan key (- = stdin)
 ```
@@ -34,7 +37,8 @@ spaghetti [OPTIONS] <PATTERN>...
   <PATTERN>...  address prefix, full (sp1qq?pasta) or bare (pasta = sp1qq?pasta); ? = any char
   -n, --network <NETWORK>      mainnet (hrp sp) | testnet, signet (hrp tsp, the BIP352 hrp for both) |
                                regtest (hrp sprt) [default: mainnet]
-  -c, --cores <N>              OS threads, at most 1024 [default: available_parallelism]
+  -c, --cores <N>              OS threads, at most 1024 [default: available_parallelism, or 0 with --gpu]
+      --gpu                    search on the Apple GPU (Metal); only in builds with --features gpu
   -k, --count <N>              stop after N matches [default: 1]
   -s, --spend-pubkey <HEX33>   spend public key used to render the example address (random throwaway one if omitted)
   -b, --base-pubkey <HEX33>    split-key mode: search offsets from this compressed scan pubkey D
@@ -135,6 +139,8 @@ Expected candidates = `2^(constrained x bits)` = `32^n` for `n` fixed chars afte
 
 The search is memoryless: the ETA in the progress line is `(expected − tested) / rate`, but the true expected remaining time is always `expected / rate` regardless of how long you have already searched.
 
+**GPU.** With `--gpu` (feature `gpu`, macOS) the same search runs as a Metal compute kernel. Measured on an Apple M3 Pro (18-core GPU): **~1.9 G x-candidates/s**, against 413 M/s for its 12 CPU threads; `--gpu -c 12` runs both and reaches ~2.2 G/s. The default configuration (32768 walks of batch 1024, hidden options `--gpu-threads` and `--gpu-batch`) uses about 540 MB of GPU memory for the prefix products; halve `--gpu-threads` to halve it at a cost of some 10% in rate.
+
 ## How it works
 
 Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on the CPU:
@@ -149,7 +155,9 @@ Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on
 
 Split-key mode reuses the same walk with centre `D + k0·G`, taking `2^44`-offset ranges from a shared queue; `recover` reuses it with generator `−2^K·G` and centre `s·λ^{-e}·B − D` for the giant steps, so the giant-step rate is the walk rate minus a table lookup (an 8 MB bitmap filter in front of a bucketed sorted array of the top 64 bits of `x`).
 
-Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The default build has no `unsafe` and no assembly. `cargo build --release --features asm` swaps in AArch64 inline assembly for the field operations (`src/field/aarch64.rs`, tested against the portable code); on an Apple M3 it measured level with the default, which the compiler already compiles to the same multiply and add-with-carry chains, so it is only worth trying on other ARM cores. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
+**GPU** (`src/gpu.rs`, `src/gpu/search.metal`, feature `gpu`). One Metal thread owns one walk and runs the same batch: differences to the table points, prefix products into a per-walk slice of a device buffer, one Fermat inversion, the backward pass, the pair formulas and the endomorphism test, then the jump. The pattern test on the GPU is the top-64-bit key check only; every hit goes back to the host as `(walk, batch, offset, e, x)` and takes the CPU search's slow path unchanged (`resolve_hit`: k256 reconstruction of the scalar, x re-derived and compared, parity fix, then the final address check), so nothing the GPU computes is trusted. The host keeps every walk's start scalar (in a zeroizing vector; the GPU buffers only ever hold public points) and advances it by `2H+1` per batch; random mode reseeds a walk after its first hit like the CPU worker, split mode gives each walk a `2^44 / walks` slice of the current range. The field arithmetic is 8×32-bit limbs (the GPU ALUs are 32-bit): a Karatsuba level over column-wise 32×32→64 limb products, reduced like `reduce_wide`; each operation is tested against the CPU field, and a match-everything pattern test checks every visited x of a batch against k256. A dispatch is a few batches per walk, adapted to last about 150 ms.
+
+Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The default build has no `unsafe` and no assembly (the `gpu` build's `unsafe` is confined to reading the shared Metal buffers). `cargo build --release --features asm` swaps in AArch64 inline assembly for the field operations (`src/field/aarch64.rs`, tested against the portable code); on an Apple M3 it measured level with the default, which the compiler already compiles to the same multiply and add-with-carry chains, so it is only worth trying on other ARM cores. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
 
 ## Security notes
 
@@ -157,7 +165,8 @@ Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit impleme
 - **Random mode is for throwaway or test keys.** Its key is not BIP32-derived: wallets derive the scan key from the seed (`m/352'/0'/0'/1'/0`), so such a key cannot be recovered from the seed phrase, and it exists in this program's memory and output. **Split-key mode is the way to mine a key for a real wallet**: `spaghetti` only ever sees the public base key and prints a public tweak; the secret is computed by `apply`, which reads `d` from a file or stdin, never from the command line.
 - `--output` writes the secret to a new file with mode 0600 and refuses to overwrite an existing one; stdout then carries everything but the secret line. Secrets (scalars, their hex, the file read by `apply`) are held in zeroizing wrappers and wiped when dropped. Both are best effort: the OS can still swap or core-dump the process.
 - Operational rules for a real key: build from source and verify the commit signature, run offline, use encrypted swap (or none), do not run inside a terminal that logs its scrollback, and if the key must travel pipe `--output` through `age` or `gpg` rather than copying the plaintext file.
-- Keys come from the OS RNG (`getrandom` via `k256`); the search walks a public additive sequence from that random start, so every found key is as unpredictable as its start point. The randomly generated spend key printed when `-s` is omitted is a throwaway used only to render an example address.
+- Keys come from the OS RNG (`getrandom` via `k256`); the search walks a public additive sequence from that random start, so every found key is as unpredictable as its start point. With `--gpu` the start scalars stay on the host: the GPU sees only the public walk centres and table, and reports public x coordinates.
+ The randomly generated spend key printed when `-s` is omitted is a throwaway used only to render an example address.
 - Several keys from one run (`-k N`) are unrelated: after every match the worker moves to a fresh random start. Keys that came from one walk would differ by a small public offset (times `λ^e`, `±1`), which lets anyone prove they belong together (baby-step giant-step on the difference) and turns one leaked secret into the others.
 - Split-key mode is linkable by construction: every vanity key is `D` plus a small public offset, so all vanity addresses made from one base key `D` (across reruns and tweaks) are provably related to each other, and a published tweak reveals `D` itself (see "What to store"). Use it for one vanity key per wallet, and a random-mode key when the addresses must not be linkable.
 
@@ -165,6 +174,8 @@ Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit impleme
 
 ```
 cargo test                                  # field reference tests, BIP352 + BIP32 vectors, search vs k256, split-key flow
+cargo test --features gpu                   # + the Metal kernel against the CPU field and k256 (macOS; skipped without a GPU)
+cargo test --release --features gpu bench -- --ignored --nocapture   # GPU field-operation rates
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
