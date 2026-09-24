@@ -4,29 +4,47 @@
 
 use std::fmt;
 use std::str::FromStr;
+use std::sync::LazyLock;
 
-use k256::elliptic_curve::scalar::FromUintUnchecked;
-use k256::{ProjectivePoint, Scalar, U256};
+use k256::elliptic_curve::PrimeField;
+use k256::{ProjectivePoint, Scalar};
 
 /// Upper bound on every published tweak offset: `2^52`. The search only visits
 /// offsets below it, and `recover` only scans below it.
 pub const MAX_TWEAK_BITS: u32 = 52;
 
-/// The secp256k1 GLV scalar λ: λ·(x, y) = (β·x, y), λ³ = 1.
-fn lambda() -> Scalar {
-    Scalar::from_uint_unchecked(U256::from_be_hex(
-        "5363ad4cc05c30e0a5261c028812645a122e22ea20816678df02967c1b23bd72",
-    ))
+/// The secp256k1 GLV scalar λ: λ·(x, y) = (β·x, y), λ³ = 1, big-endian
+/// (`0x5363ad4c…1b23bd72`).
+const LAMBDA_BYTES: [u8; 32] = [
+    0x53, 0x63, 0xad, 0x4c, 0xc0, 0x5c, 0x30, 0xe0, 0xa5, 0x26, 0x1c, 0x02, 0x88, 0x12, 0x64, 0x5a,
+    0x12, 0x2e, 0x22, 0xea, 0x20, 0x81, 0x66, 0x78, 0xdf, 0x02, 0x96, 0x7c, 0x1b, 0x23, 0xbd, 0x72,
+];
+
+/// `[1, λ, λ²]`. k256 has no `const` constructor for `Scalar`, so the table is
+/// built once, on first use, into a `static` (a `const LazyLock` would be
+/// re-instantiated, and recomputed, at every use site) with the checked
+/// constructor: `from_repr` rejects anything that is not a canonical scalar.
+static LAMBDA_POWERS: LazyLock<[Scalar; 3]> = LazyLock::new(|| {
+    let lambda = Option::from(Scalar::from_repr(LAMBDA_BYTES.into()))
+        .expect("λ is a canonical secp256k1 scalar");
+    [Scalar::ONE, lambda, lambda.mul(&lambda)]
+});
+
+/// `λ^e` for `e ∈ {0, 1, 2}` (any `e` is reduced mod 3): a table lookup.
+#[inline]
+pub fn lambda_pow(e: u8) -> Scalar {
+    LAMBDA_POWERS[usize::from(e % 3)]
 }
 
-/// `λ^e` for `e ∈ {0, 1, 2}` (any `e` is reduced mod 3).
-pub fn lambda_pow(e: u8) -> Scalar {
-    let mut out = Scalar::ONE;
-    for _ in 0..e % 3 {
-        out = out.mul(&lambda());
-    }
-    out
-}
+/// The six `(e, s)` variants, in `recover`'s search order.
+pub const VARIANTS: [(u8, bool); 6] = [
+    (0, false),
+    (0, true),
+    (1, false),
+    (1, true),
+    (2, false),
+    (2, true),
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Tweak {
@@ -59,10 +77,8 @@ impl Tweak {
 
     /// The six `(e, s)` variants of one offset.
     #[cfg(test)]
-    pub fn variants(t: u64) -> Vec<Tweak> {
-        (0..3u8)
-            .flat_map(|endo| [false, true].map(|negate| Tweak { t, endo, negate }))
-            .collect()
+    pub fn variants(t: u64) -> [Tweak; 6] {
+        VARIANTS.map(|(endo, negate)| Tweak { t, endo, negate })
     }
 }
 
@@ -157,11 +173,13 @@ mod tests {
 
     #[test]
     fn lambda_powers() {
+        let lambda = lambda_pow(1);
+        assert_ne!(lambda, Scalar::ONE);
         assert_eq!(lambda_pow(0), Scalar::ONE);
-        assert_eq!(lambda_pow(1), lambda());
-        assert_eq!(lambda_pow(2), lambda().mul(&lambda()));
-        assert_eq!(lambda_pow(2).mul(&lambda()), Scalar::ONE);
+        assert_eq!(lambda_pow(2), lambda.mul(&lambda));
+        assert_eq!(lambda_pow(2).mul(&lambda), Scalar::ONE);
         assert_eq!(lambda_pow(3), Scalar::ONE);
+        assert_eq!(lambda_pow(4), lambda);
     }
 
     #[test]

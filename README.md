@@ -140,7 +140,7 @@ The search is memoryless: the ETA in the progress line is `(expected − tested)
 Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on the CPU:
 
 1. Random start scalar `k0`, centre point `C = k0·G` (computed with `k256`; a fresh `k0` after every match).
-2. A shared table holds `j·G` for `j = 1..=H` (`H = 1024`, `--batch` to change) and the jump `(2H+1)·G`.
+2. A shared table holds `j·G` for `j = 1..=H` (`H = 4096`, `--batch` to change) and the jump `(2H+1)·G`.
 3. Per batch, the x coordinates of `C ± j·G` are computed with a single field inversion (Montgomery's trick over `T[j].x − C.x`, as four interleaved product chains so consecutive multiplications do not wait on each other): 3 multiplications per inverse plus 2 multiplications and 2 squarings per pair of points. The same inversion batch also produces `C += (2H+1)·G`.
 4. **x-only**: result y coordinates are never computed. Negating the scalar flips the y parity for free, so matching happens on x alone and the parity required by a fixed 6th char is fixed afterwards.
 5. **Endomorphism**: for every x, `β·x` and `β²·x` are also tested (scalars `λk`, `λ²k`). One multiplication (`β·x`) and one addition (`β²·x = −x − β·x`, since `β² + β + 1 = 0`) buy two extra candidates.
@@ -149,7 +149,7 @@ Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on
 
 Split-key mode reuses the same walk with centre `D + k0·G`, taking `2^44`-offset ranges from a shared queue; `recover` reuses it with generator `−2^K·G` and centre `s·λ^{-e}·B − D` for the giant steps, so the giant-step rate is the walk rate minus a table lookup (an 8 MB bitmap filter in front of a bucketed sorted array of the top 64 bits of `x`).
 
-Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` (no `unsafe`, no assembly), written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
+Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The default build has no `unsafe` and no assembly. `cargo build --release --features asm` swaps in AArch64 inline assembly for the field operations (`src/field/aarch64.rs`, tested against the portable code); on an Apple M3 it measured level with the default, which the compiler already compiles to the same multiply and add-with-carry chains, so it is only worth trying on other ARM cores. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
 
 ## Security notes
 

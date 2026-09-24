@@ -4,6 +4,14 @@
 //! (canonical, `< p`) after every operation. Products are reduced with two
 //! folds of the high half times `c = 2^32 + 977` (since `2^256 ≡ c mod p`),
 //! followed by a single conditional subtraction of `p`.
+//!
+//! The hot operations have an opt-in AArch64 assembly version
+//! (`field/aarch64.rs`, feature `asm`, the crate's only `unsafe`); the
+//! portable Rust version is the default everywhere and the reference the
+//! assembly is tested against.
+
+#[cfg(all(target_arch = "aarch64", feature = "asm"))]
+mod aarch64;
 
 /// `2^256 mod p`.
 const C: u64 = 0x1_0000_03D1;
@@ -72,6 +80,16 @@ impl Fe {
         self.0[3]
     }
 
+    /// `self.neg().top_limb()` for a non-zero `self`, without the other limbs:
+    /// `p − s` borrows into the top limb exactly when the low 192 bits of `s`
+    /// exceed those of `p` (all ones above `P[0]`).
+    #[inline(always)]
+    pub fn neg_top_limb(&self) -> u64 {
+        let s = &self.0;
+        let borrow = (s[1] & s[2]) == u64::MAX && s[0] > P[0];
+        (!s[3]).wrapping_sub(u64::from(borrow))
+    }
+
     /// Subtracts `p` if the value is `>= p` (input must be `< 2p`).
     /// `r >= p` exactly when `r + c` carries out of 256 bits, and then
     /// `r - p = (r + c) mod 2^256`.
@@ -85,6 +103,46 @@ impl Fe {
 
     #[inline(always)]
     pub fn add(&self, rhs: &Fe) -> Fe {
+        #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+        {
+            Fe(aarch64::add(&self.0, &rhs.0))
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "asm")))]
+        {
+            self.add_generic(rhs)
+        }
+    }
+
+    #[inline(always)]
+    pub fn sub(&self, rhs: &Fe) -> Fe {
+        #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+        {
+            Fe(aarch64::sub(&self.0, &rhs.0))
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "asm")))]
+        {
+            self.sub_generic(rhs)
+        }
+    }
+
+    #[inline(always)]
+    pub fn neg(&self) -> Fe {
+        if self.is_zero() {
+            return zero_cold();
+        }
+        #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+        {
+            Fe(aarch64::neg(&self.0))
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "asm")))]
+        {
+            self.neg_generic()
+        }
+    }
+
+    #[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
+    #[inline(always)]
+    pub fn add_generic(&self, rhs: &Fe) -> Fe {
         let a = &self.0;
         let b = &rhs.0;
         let (r0, c) = a[0].overflowing_add(b[0]);
@@ -98,41 +156,72 @@ impl Fe {
         Fe(select(c3 | c, &t, &r))
     }
 
+    /// Subtraction as a borrow chain written in complement form (see [`sbb`]).
+    #[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
     #[inline(always)]
-    pub fn sub(&self, rhs: &Fe) -> Fe {
+    pub fn sub_generic(&self, rhs: &Fe) -> Fe {
         let a = &self.0;
         let b = &rhs.0;
-        let (r0, b0) = a[0].overflowing_sub(b[0]);
-        let (r1, b1) = sbb(a[1], b[1], b0);
-        let (r2, b2) = sbb(a[2], b[2], b1);
-        let (r3, b3) = sbb(a[3], b[3], b2);
-        // Wrapped below zero: add p back, i.e. subtract c = 2^256 - p from
-        // the wrapped value (which is > c, so this cannot underflow).
-        let c = if b3 { C } else { 0 };
-        let (r0, b0) = r0.overflowing_sub(c);
-        let (r1, b1) = r1.overflowing_sub(u64::from(b0));
-        let (r2, b2) = r2.overflowing_sub(u64::from(b1));
-        Fe([r0, r1, r2, r3.wrapping_sub(u64::from(b2))])
+        let (r0, borrow) = a[0].overflowing_sub(b[0]);
+        let (r1, carry) = sbb(a[1], b[1], !borrow);
+        let (r2, carry) = sbb(a[2], b[2], carry);
+        let (r3, carry) = sbb(a[3], b[3], carry);
+        // Wrapped below zero (no carry out): add p back, i.e. subtract
+        // c = 2^256 - p from the wrapped value (which is > c, so this cannot
+        // underflow).
+        let c = if carry { 0 } else { C };
+        let (r0, borrow) = r0.overflowing_sub(c);
+        let (r1, carry) = sbb(r1, 0, !borrow);
+        let (r2, carry) = sbb(r2, 0, carry);
+        let (r3, _) = sbb(r3, 0, carry);
+        Fe([r0, r1, r2, r3])
     }
 
+    /// `p − s` for non-zero `s`.
+    #[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
     #[inline(always)]
-    pub fn neg(&self) -> Fe {
-        if self.is_zero() {
-            return zero_cold();
-        }
+    pub fn neg_generic(&self) -> Fe {
         // 0 < s < p, so p − s never borrows out of 256 bits and is canonical;
         // P[1..4] are all ones.
         let s = &self.0;
-        let (r0, b0) = P[0].overflowing_sub(s[0]);
-        let (r1, b1) = (!s[1]).overflowing_sub(u64::from(b0));
-        let (r2, b2) = (!s[2]).overflowing_sub(u64::from(b1));
-        Fe([r0, r1, r2, (!s[3]).wrapping_sub(u64::from(b2))])
+        let (r0, borrow) = P[0].overflowing_sub(s[0]);
+        let (r1, carry) = sbb(u64::MAX, s[1], !borrow);
+        let (r2, carry) = sbb(u64::MAX, s[2], carry);
+        let (r3, _) = sbb(u64::MAX, s[3], carry);
+        Fe([r0, r1, r2, r3])
+    }
+
+    #[inline(always)]
+    pub fn mul(&self, rhs: &Fe) -> Fe {
+        #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+        {
+            let (r, rare) = aarch64::mul(&self.0, &rhs.0);
+            finish(r, rare)
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "asm")))]
+        {
+            self.mul_generic(rhs)
+        }
+    }
+
+    #[inline(always)]
+    pub fn square(&self) -> Fe {
+        #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+        {
+            let (r, rare) = aarch64::square(&self.0);
+            finish(r, rare)
+        }
+        #[cfg(not(all(target_arch = "aarch64", feature = "asm")))]
+        {
+            self.square_generic()
+        }
     }
 
     /// Schoolbook product, one row per limb of `self`; each row adds its low
     /// and high halves as two carry chains so the compiler can use the flags.
+    #[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
     #[inline(always)]
-    pub fn mul(&self, rhs: &Fe) -> Fe {
+    pub fn mul_generic(&self, rhs: &Fe) -> Fe {
         let a = &self.0;
         let b = &rhs.0;
         let (w0, h0) = mul_wide(a[0], b[0]);
@@ -150,8 +239,9 @@ impl Fe {
         reduce_wide(&w)
     }
 
+    #[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
     #[inline(always)]
-    pub fn square(&self) -> Fe {
+    pub fn square_generic(&self) -> Fe {
         let [a0, a1, a2, a3] = self.0;
         // Off-diagonal products, each counted once.
         let (w1, h01) = mul_wide(a0, a1);
@@ -223,6 +313,7 @@ impl Fe {
     }
 }
 
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
 fn adc(a: u64, b: u64, carry: bool) -> (u64, bool) {
     let (s, c1) = a.overflowing_add(b);
@@ -230,14 +321,19 @@ fn adc(a: u64, b: u64, carry: bool) -> (u64, bool) {
     (s, c1 | c2)
 }
 
+/// `a - b - (1 - carry)` as (difference, carry out), i.e. one step of a
+/// borrow chain with the borrow kept inverted, as the flag register holds it:
+/// `a - b - borrow = a + !b + (1 - borrow)`. Written as an addition because
+/// the compiler turns [`adc`] chains into add-with-carry instructions but
+/// does not fuse the equivalent subtraction chains.
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
-fn sbb(a: u64, b: u64, borrow: bool) -> (u64, bool) {
-    let (d, b1) = a.overflowing_sub(b);
-    let (d, b2) = d.overflowing_sub(u64::from(borrow));
-    (d, b1 | b2)
+fn sbb(a: u64, b: u64, carry: bool) -> (u64, bool) {
+    adc(a, !b, carry)
 }
 
 /// `a * b` as (lo, hi).
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
 fn mul_wide(a: u64, b: u64) -> (u64, u64) {
     let t = (a as u128) * (b as u128);
@@ -246,6 +342,7 @@ fn mul_wide(a: u64, b: u64) -> (u64, u64) {
 
 /// `w += ai * b << (64 i)` for `1 <= i <= 3`, given `w < 2^(64 (i + 4))`
 /// (so `w[i + 4..]` is zero and the result fits in `w[..i + 5]`).
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
 fn mul_row(w: &mut [u64; 8], i: usize, ai: u64, b: &[u64; 4]) {
     let (l0, h0) = mul_wide(ai, b[0]);
@@ -270,6 +367,7 @@ fn mul_row(w: &mut [u64; 8], i: usize, ai: u64, b: &[u64; 4]) {
 
 /// Folds a 512-bit product to `r + c·2^256` with `r < 2^256`; when `c` is set
 /// (probability about 2^-190) `r` is tiny.
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
 fn fold_wide(w: &[u64; 8]) -> ([u64; 4], bool) {
     // First fold: r = lo + hi * c. hi * c < 2^290, so the carry out is < 2^35.
@@ -296,6 +394,7 @@ fn fold_wide(w: &[u64; 8]) -> ([u64; 4], bool) {
 }
 
 /// Reduces a 512-bit little-endian product to a canonical element.
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
 fn reduce_wide(w: &[u64; 8]) -> Fe {
     let (r, c) = fold_wide(w);
@@ -303,7 +402,13 @@ fn reduce_wide(w: &[u64; 8]) -> Fe {
     // r + c is the canonical result; otherwise r < 2^256 and r + c carries
     // exactly when r >= p, giving r - p.
     let (_, c2) = add_c(&r);
-    if c | c2 {
+    finish(r, c | c2)
+}
+
+/// Canonical element from a folded product: `r` itself, or the rare tail.
+#[inline(always)]
+fn finish(r: [u64; 4], rare: bool) -> Fe {
+    if rare {
         fold_rare(r[0], r[1], r[2], r[3])
     } else {
         Fe(r)
@@ -337,6 +442,7 @@ fn add_c(a: &[u64; 4]) -> ([u64; 4], bool) {
 }
 
 /// `if cond { a } else { b }`, written limb-wise so it compiles to selects.
+#[cfg(any(not(all(target_arch = "aarch64", feature = "asm")), test))]
 #[inline(always)]
 fn select(cond: bool, a: &[u64; 4], b: &[u64; 4]) -> [u64; 4] {
     let m = 0u64.wrapping_sub(u64::from(cond));
@@ -411,6 +517,50 @@ mod tests {
             Fe([0xFFFF_FFFE_FFFF_FC2E, u64::MAX, u64::MAX, u64::MAX]),
             Fe([0x1_0000_03D1, 0, 0, 0]),
         ]
+    }
+
+    /// The assembly multiplication and squaring agree with the portable
+    /// implementation on edge cases and biased random inputs.
+    #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+    #[test]
+    fn asm_matches_generic() {
+        let mut rng = Rng(0x0dd0_1234_5678_9abc);
+        let mut cases = edge_cases();
+        cases.extend((0..5000).map(|_| rng.fe()));
+        for a in &cases {
+            assert_eq!(a.square(), a.square_generic(), "{a:?}");
+            assert_eq!(a.mul(a), a.square_generic(), "{a:?}");
+            if !a.is_zero() {
+                assert_eq!(a.neg(), a.neg_generic(), "{a:?}");
+            }
+            for b in cases.iter().step_by(37) {
+                assert_eq!(a.mul(b), a.mul_generic(b), "{a:?} * {b:?}");
+                assert_eq!(a.mul(b), b.mul(a), "{a:?} * {b:?}");
+                assert_eq!(a.add(b), a.add_generic(b), "{a:?} + {b:?}");
+                assert_eq!(a.sub(b), a.sub_generic(b), "{a:?} - {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn neg_top_limb_matches_neg() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut cases = edge_cases();
+        cases.extend((0..2000).map(|_| rng.fe()));
+        // Values whose low 192 bits straddle those of p: the borrow flips.
+        for low in [P[0] - 1, P[0], P[0] + 1] {
+            for top in [0u64, 1, 5, u64::MAX - 1] {
+                cases.push(Fe([low, u64::MAX, u64::MAX, top]));
+            }
+        }
+        for s in cases {
+            if s.is_zero()
+                || s.0[3] == u64::MAX && s.0[2] == u64::MAX && s.0[1] == u64::MAX && s.0[0] >= P[0]
+            {
+                continue;
+            }
+            assert_eq!(s.neg_top_limb(), s.neg().top_limb(), "{s:?}");
+        }
     }
 
     fn check_canonical(fe: &Fe) {
@@ -556,6 +706,11 @@ mod tests {
             let got = reduce_wide(&w);
             check_canonical(&got);
             assert_eq!(to_big(&got), (&lo + (&hi << 256u32)) % p(), "extra {extra}");
+            #[cfg(all(target_arch = "aarch64", feature = "asm"))]
+            {
+                let (r, rare) = aarch64::fold(&w);
+                assert_eq!(finish(r, rare), got, "asm fold, extra {extra}");
+            }
         }
     }
 

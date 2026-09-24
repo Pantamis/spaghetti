@@ -106,25 +106,24 @@ impl Table {
 /// `i ≡ k (mod LANES)`.
 const LANES: usize = 4;
 
-/// Inverts every element of `values` with one field inversion.
-/// `scratch` and `out` must have the same length as `values`.
-/// Returns `false` (leaving `out` unspecified) if any value is zero.
-fn batch_invert(values: &[Fe], scratch: &mut [Fe], out: &mut [Fe]) -> bool {
+/// Inverts every element of `values` with one field inversion, in place into
+/// `inv` (same length as `values`), which doubles as the scratch buffer.
+/// Returns `false` (leaving `inv` unspecified) if any value is zero.
+fn batch_invert(values: &[Fe], inv: &mut [Fe]) -> bool {
     let n = values.len();
     if n == 0 {
         return true;
     }
-    let scratch = &mut scratch[..n];
-    let out = &mut out[..n];
-    // Forward pass: scratch[i] = values[i mod LANES] · … · values[i - LANES] · values[i].
+    let inv = &mut inv[..n];
+    // Forward pass: inv[i] = values[i mod LANES] · … · values[i - LANES] · values[i].
     let head = LANES.min(n);
-    scratch[..head].copy_from_slice(&values[..head]);
+    inv[..head].copy_from_slice(&values[..head]);
     for i in LANES..n {
-        scratch[i] = scratch[i - LANES].mul(&values[i]);
+        inv[i] = inv[i - LANES].mul(&values[i]);
     }
     // The lane totals are the last `head` entries (one per lane); invert their
     // product once and split it with Montgomery's trick over the lanes.
-    let totals = &scratch[n - head..];
+    let totals = &inv[n - head..];
     let mut prefix = [Fe::ONE; LANES];
     for k in 1..head {
         prefix[k] = prefix[k - 1].mul(&totals[k - 1]);
@@ -133,20 +132,21 @@ fn batch_invert(values: &[Fe], scratch: &mut [Fe], out: &mut [Fe]) -> bool {
     if all.is_zero() {
         return false;
     }
-    let mut inv = all.invert();
+    let mut all_inv = all.invert();
     // state[lane] = 1 / (product of that lane), indexed by the lane of the total.
     let mut state = [Fe::ZERO; LANES];
     for k in (0..head).rev() {
-        state[(n - head + k) % LANES] = inv.mul(&prefix[k]);
-        inv = inv.mul(&totals[k]);
+        state[(n - head + k) % LANES] = all_inv.mul(&prefix[k]);
+        all_inv = all_inv.mul(&totals[k]);
     }
-    // Backward pass: out[i] = state · scratch[i - LANES]; state ·= values[i].
+    // Backward pass, in place: inv[i] = state · inv[i - LANES]; state ·= values[i].
+    // Entry i is only ever read by step i + LANES, which ran before step i.
     for i in (LANES..n).rev() {
         let lane = i % LANES;
-        out[i] = state[lane].mul(&scratch[i - LANES]);
+        inv[i] = state[lane].mul(&inv[i - LANES]);
         state[lane] = state[lane].mul(&values[i]);
     }
-    out[..head].copy_from_slice(&state[..head]);
+    inv[..head].copy_from_slice(&state[..head]);
     true
 }
 
@@ -187,7 +187,6 @@ pub struct Walk<'a> {
     /// The centre is the point at infinity: the batch formulas do not apply.
     degenerate: bool,
     dx: Vec<Fe>,
-    scratch: Vec<Fe>,
     inv: Vec<Fe>,
 }
 
@@ -204,7 +203,6 @@ impl<'a> Walk<'a> {
             cy: Fe::ZERO,
             degenerate: false,
             dx: vec![Fe::ZERO; n],
-            scratch: vec![Fe::ZERO; n],
             inv: vec![Fe::ZERO; n],
         };
         walk.recompute_centre();
@@ -264,7 +262,7 @@ impl<'a> Walk<'a> {
             }
             dx_jump[0] = table.jump_x.sub(&cx);
         }
-        if !batch_invert(&self.dx, &mut self.scratch, &mut self.inv) {
+        if !batch_invert(&self.dx, &mut self.inv) {
             // C == ±j·P for some j in the table (probability ~2^-247 for a
             // random start; a real case for the giant steps of `recover`):
             // jump via k256 instead and skip this batch.
@@ -272,13 +270,15 @@ impl<'a> Walk<'a> {
             return false;
         }
         visitor.visit(0, &cx);
+        // ty + cy as ty − (−cy): a subtraction compiles shorter than an addition.
+        let neg_cy = cy.neg();
         for (j, ((tx, ty), inv)) in xs.iter().zip(ys).zip(&self.inv[..h]).enumerate() {
             let offset = j as i64 + 1;
             // x(C ± T) = λ² − cx − tx with λ = (±ty − cy) / (tx − cx); only λ²
             // is needed, so the slope of C − T is taken as (ty + cy) / dx.
             let sum = cx.add(tx);
             let lambda_plus = ty.sub(&cy).mul(inv);
-            let lambda_minus = ty.add(&cy).mul(inv);
+            let lambda_minus = ty.sub(&neg_cy).mul(inv);
             let x_plus = lambda_plus.square().sub(&sum);
             let x_minus = lambda_minus.square().sub(&sum);
             visitor.visit_pair(offset, &x_plus, &x_minus);
@@ -295,13 +295,41 @@ impl<'a> Walk<'a> {
 
     /// One batch of pattern matching; pushes hits into `out`.
     #[inline]
-    fn search_batch<'p>(&mut self, patterns: &'p PatternSet, out: &mut Vec<Candidate<'p>>) -> bool {
+    fn search_batch<'p, K: Keys>(
+        &mut self,
+        keys: K,
+        patterns: &'p PatternSet,
+        out: &mut Vec<Candidate<'p>>,
+    ) -> bool {
         self.batch(Searcher {
-            keys: &patterns.keys,
+            keys,
             patterns,
             out,
             k0: self.k0.clone(),
         })
+    }
+}
+
+/// The top-limb `(mask, value)` keys of the patterns, as seen by the batch
+/// loop. Implemented for fixed-size arrays so that the common pattern counts
+/// are monomorphised into straight-line compares (no length check, no loop),
+/// and for a slice as the fallback for any count.
+pub trait Keys: Copy {
+    /// Does `top` (the top limb of an x coordinate) match any pattern?
+    fn hit(&self, top: u64) -> bool;
+}
+
+impl<const N: usize> Keys for [(u64, u64); N] {
+    #[inline(always)]
+    fn hit(&self, top: u64) -> bool {
+        self.iter().any(|&(mask, value)| top & mask == value)
+    }
+}
+
+impl Keys for &[(u64, u64)] {
+    #[inline(always)]
+    fn hit(&self, top: u64) -> bool {
+        self.iter().any(|&(mask, value)| top & mask == value)
     }
 }
 
@@ -320,54 +348,78 @@ struct Candidate<'p> {
 }
 
 /// Tests `x`, `β·x` and `β²·x` of every visited point against the patterns.
-struct Searcher<'p, 'o> {
-    /// Top-limb (mask, value) of every pattern, in a flat array so the check
-    /// is one load per pattern and nothing is reloaded through `PatternSet`.
-    keys: &'p [(u64, u64)],
+struct Searcher<'p, 'o, K: Keys> {
+    /// Top-limb (mask, value) of every pattern, held by value so the check
+    /// is a compare per pattern and nothing is reloaded through `PatternSet`.
+    keys: K,
     patterns: &'p PatternSet,
     out: &'o mut Vec<Candidate<'p>>,
     k0: Zeroizing<Scalar>,
 }
 
-impl Visit for Searcher<'_, '_> {
+impl<K: Keys> Visit for Searcher<'_, '_, K> {
     #[inline(always)]
     fn visit(&mut self, offset: i64, x: &Fe) {
-        let [bx, b2x] = endomorphisms(x);
-        self.check(offset, x, &bx, &b2x);
+        let (bx, b2x_top) = endomorphisms(x);
+        let hits = self.hits(x, &bx, b2x_top);
+        if hits != 0 {
+            self.push_hits(hits, offset, x, &bx);
+        }
     }
 
+    /// Both points' arithmetic and top-limb tests before the single branch:
+    /// the loop body stays one basic block, which the compiler can schedule
+    /// as a whole (the plus and minus chains are independent).
     #[inline(always)]
     fn visit_pair(&mut self, offset: i64, x_plus: &Fe, x_minus: &Fe) {
-        let [bx_plus, b2x_plus] = endomorphisms(x_plus);
-        let [bx_minus, b2x_minus] = endomorphisms(x_minus);
-        self.check(offset, x_plus, &bx_plus, &b2x_plus);
-        self.check(-offset, x_minus, &bx_minus, &b2x_minus);
+        let (bx_plus, b2x_top_plus) = endomorphisms(x_plus);
+        let (bx_minus, b2x_top_minus) = endomorphisms(x_minus);
+        let hits_plus = self.hits(x_plus, &bx_plus, b2x_top_plus);
+        let hits_minus = self.hits(x_minus, &bx_minus, b2x_top_minus);
+        if hits_plus | hits_minus != 0 {
+            self.push_hits(hits_plus, offset, x_plus, &bx_plus);
+            self.push_hits(hits_minus, -offset, x_minus, &bx_minus);
+        }
     }
 }
 
-/// `β·x` and `β²·x`. Since β² + β + 1 = 0, β²·x = −(x + β·x): an add and a
-/// negation instead of a second multiplication.
+/// `β·x` and the top limb of `β²·x`. Since β² + β + 1 = 0,
+/// β²·x = −(x + β·x): an add and a negation instead of a second
+/// multiplication, and the hot loop only needs the top limb of the negation
+/// (the full value is recomputed by [`endomorphism`] on a hit). `x + β·x` is
+/// never zero: it would mean x = 0, which is not on the curve.
 #[inline(always)]
-fn endomorphisms(x: &Fe) -> [Fe; 2] {
+fn endomorphisms(x: &Fe) -> (Fe, u64) {
     let bx = Fe::BETA.mul(x);
-    [bx, bx.add(x).neg()]
+    (bx, bx.add(x).neg_top_limb())
 }
 
-impl<'p> Searcher<'p, '_> {
-    /// Top-limb test of the three candidates of one point.
+/// `λ^endo` applied to `x` given `x` and `β·x`.
+fn endomorphism(x: &Fe, bx: &Fe, endo: u8) -> Fe {
+    match endo {
+        0 => *x,
+        1 => *bx,
+        _ => bx.add(x).neg(),
+    }
+}
+
+impl<'p, K: Keys> Searcher<'p, '_, K> {
+    /// Top-limb test of the three candidates of one point, as a bit mask
+    /// (bit `e` set when `λ^e·x` matched a key): branch-free.
     #[inline(always)]
-    fn check(&mut self, offset: i64, x: &Fe, bx: &Fe, b2x: &Fe) {
-        for (endo, candidate) in [x, bx, b2x].into_iter().enumerate() {
-            let top = candidate.top_limb();
-            if self.keys.iter().any(|&(mask, value)| top & mask == value) {
-                push_candidate(
-                    self.out,
-                    self.patterns,
-                    &self.k0,
-                    offset,
-                    endo as u8,
-                    candidate,
-                );
+    fn hits(&self, x: &Fe, bx: &Fe, b2x_top: u64) -> u8 {
+        u8::from(self.keys.hit(x.top_limb()))
+            | u8::from(self.keys.hit(bx.top_limb())) << 1
+            | u8::from(self.keys.hit(b2x_top)) << 2
+    }
+
+    /// Full check of the candidates flagged in `hits`.
+    #[cold]
+    #[inline(never)]
+    fn push_hits(&mut self, hits: u8, offset: i64, x: &Fe, bx: &Fe) {
+        for endo in 0..3u8 {
+            if hits >> endo & 1 != 0 {
+                push_candidate(self.out, self.patterns, &self.k0, offset, endo, x, bx);
             }
         }
     }
@@ -383,13 +435,15 @@ fn push_candidate<'p>(
     offset: i64,
     endo: u8,
     x: &Fe,
+    bx: &Fe,
 ) {
-    if let Some(pattern) = patterns.find(x) {
+    let x = endomorphism(x, bx, endo);
+    if let Some(pattern) = patterns.find(&x) {
         out.push(Candidate {
             k0: Zeroizing::new(*k0),
             offset,
             endo,
-            x: *x,
+            x,
             pattern,
         });
     }
@@ -505,14 +559,48 @@ pub fn split_coverage(half: usize) -> f64 {
     3.0 * per_range * SPLIT_RANGES as f64
 }
 
-/// State shared by the worker threads of one search.
+/// A counter on its own cache line (128 bytes on Apple silicon, 64 elsewhere):
+/// one per worker, written by that worker only, so the per-batch accounting
+/// never writes a line another core is reading. Every other atomic the
+/// workers touch is read-only in steady state (`stop`) or rare (`next_range`,
+/// once per `2^44` offsets), so the batch loop has no cross-core traffic.
+#[repr(align(128))]
 #[derive(Default)]
+pub struct Counter(AtomicU64);
+
+impl Counter {
+    #[inline]
+    pub fn add(&self, n: u64) {
+        self.0.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// State shared by the worker threads of one search.
 pub struct Shared {
     pub stop: AtomicBool,
-    /// x candidates tested so far.
-    pub tested: AtomicU64,
+    /// x candidates tested so far, one slot per worker.
+    tested: Vec<Counter>,
     /// Split mode: next range to hand out.
     next_range: AtomicUsize,
+}
+
+impl Shared {
+    pub fn new(threads: usize) -> Shared {
+        Shared {
+            stop: AtomicBool::new(false),
+            tested: (0..threads).map(|_| Counter::default()).collect(),
+            next_range: AtomicUsize::new(0),
+        }
+    }
+
+    /// x candidates tested so far by all workers.
+    pub fn tested(&self) -> u64 {
+        self.tested.iter().map(Counter::get).sum()
+    }
 }
 
 /// Body of one worker thread. Every hit (or error) goes to `sender`; the
@@ -526,10 +614,32 @@ pub struct Shared {
 /// the shared queue; a range starts at `i·2^44 + H` so its first batch visits
 /// `i·2^44 ..= i·2^44 + 2H`, and stops before a batch would cross the range end.
 pub fn worker(
+    index: usize,
     table: &Table,
     patterns: &PatternSet,
     mode: &Mode,
     shared: &Shared,
+    sender: &mpsc::Sender<Result<Found, String>>,
+) {
+    let tested = &shared.tested[index];
+    // Monomorphise the batch loop on the pattern count (see `Keys`).
+    match patterns.keys.as_slice() {
+        &[a] => run(table, patterns, [a], mode, shared, tested, sender),
+        &[a, b] => run(table, patterns, [a, b], mode, shared, tested, sender),
+        &[a, b, c] => run(table, patterns, [a, b, c], mode, shared, tested, sender),
+        &[a, b, c, d] => run(table, patterns, [a, b, c, d], mode, shared, tested, sender),
+        keys => run(table, patterns, keys, mode, shared, tested, sender),
+    }
+}
+
+/// [`worker`] for one `Keys` form; `tested` is this worker's own counter.
+fn run<K: Keys>(
+    table: &Table,
+    patterns: &PatternSet,
+    keys: K,
+    mode: &Mode,
+    shared: &Shared,
+    tested: &Counter,
     sender: &mpsc::Sender<Result<Found, String>>,
 ) {
     let mut hits = Vec::new();
@@ -543,10 +653,8 @@ pub fn worker(
                 }
             };
             while !shared.stop.load(Ordering::Relaxed) {
-                if walk.search_batch(patterns, &mut hits) {
-                    shared
-                        .tested
-                        .fetch_add(table.candidates_per_batch(), Ordering::Relaxed);
+                if walk.search_batch(keys, patterns, &mut hits) {
+                    tested.add(table.candidates_per_batch());
                 }
                 if let Some(candidate) = hits.first() {
                     let resolved = resolve(candidate, mode);
@@ -572,10 +680,8 @@ pub fn worker(
                 if shared.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                if walk.search_batch(patterns, &mut hits) {
-                    shared
-                        .tested
-                        .fetch_add(table.candidates_per_batch(), Ordering::Relaxed);
+                if walk.search_batch(keys, patterns, &mut hits) {
+                    tested.add(table.candidates_per_batch());
                 }
                 for candidate in hits.drain(..) {
                     if sender.send(resolve(&candidate, mode)).is_err() {
@@ -625,30 +731,28 @@ mod tests {
     #[test]
     fn batch_invert_matches_individual_inverts() {
         let values: Vec<Fe> = (0..37).map(|_| x_of(&random_scalar().unwrap())).collect();
-        let mut scratch = vec![Fe::ZERO; values.len()];
         let mut out = vec![Fe::ZERO; values.len()];
-        assert!(batch_invert(&values, &mut scratch, &mut out));
+        assert!(batch_invert(&values, &mut out));
         for (v, inv) in values.iter().zip(&out) {
             assert_eq!(*inv, v.invert());
             assert_eq!(v.mul(inv), Fe::ONE);
         }
         let mut with_zero = values.clone();
         with_zero[5] = Fe::ZERO;
-        assert!(!batch_invert(&with_zero, &mut scratch, &mut out));
-        assert!(batch_invert(&[], &mut [], &mut []));
+        assert!(!batch_invert(&with_zero, &mut out));
+        assert!(batch_invert(&[], &mut []));
         // Lengths around the lane count, and a zero in every lane position.
         for n in 1..=2 * LANES + 1 {
             let values = &values[..n];
-            let mut scratch = vec![Fe::ZERO; n];
             let mut out = vec![Fe::ZERO; n];
-            assert!(batch_invert(values, &mut scratch, &mut out), "n = {n}");
+            assert!(batch_invert(values, &mut out), "n = {n}");
             for (v, inv) in values.iter().zip(&out) {
                 assert_eq!(v.mul(inv), Fe::ONE, "n = {n}");
             }
             for zero_at in 0..n {
                 let mut with_zero = values.to_vec();
                 with_zero[zero_at] = Fe::ZERO;
-                assert!(!batch_invert(&with_zero, &mut scratch, &mut out));
+                assert!(!batch_invert(&with_zero, &mut out));
             }
         }
     }
@@ -766,7 +870,12 @@ mod tests {
             assert_eq!(x_of(&lk), Fe::BETA.mul(&x));
             assert_eq!(x_of(&l2k), Fe::BETA2.mul(&x));
             assert_eq!(x_of(&l2k.mul(&lambda_pow(1))), x);
-            assert_eq!(endomorphisms(&x), [Fe::BETA.mul(&x), Fe::BETA2.mul(&x)]);
+            let (bx, b2x_top) = endomorphisms(&x);
+            assert_eq!(bx, Fe::BETA.mul(&x));
+            assert_eq!(b2x_top, Fe::BETA2.mul(&x).top_limb());
+            assert_eq!(endomorphism(&x, &bx, 0), x);
+            assert_eq!(endomorphism(&x, &bx, 1), bx);
+            assert_eq!(endomorphism(&x, &bx, 2), Fe::BETA2.mul(&x));
         }
     }
 
@@ -822,7 +931,7 @@ mod tests {
             let mut hits = Vec::new();
             let mut batches = 0;
             while hits.is_empty() {
-                walk.search_batch(&patterns, &mut hits);
+                walk.search_batch(patterns.keys.as_slice(), &patterns, &mut hits);
                 batches += 1;
                 assert!(batches < 10_000, "no hit for {input}");
             }
@@ -863,7 +972,7 @@ mod tests {
             let mut batches = 0;
             while hits.is_empty() {
                 for walk in &mut walks {
-                    walk.search_batch(&patterns, &mut hits);
+                    walk.search_batch(patterns.keys.as_slice(), &patterns, &mut hits);
                 }
                 batches += 1;
                 assert!(batches < 10_000, "no hit for {input}");
@@ -936,10 +1045,10 @@ mod tests {
         let mode = Mode::Split {
             base: ProjectivePoint::GENERATOR,
         };
-        let shared = Shared::default();
+        let shared = Shared::new(1);
         shared.next_range.store(SPLIT_RANGES, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
-        worker(&table, &patterns, &mode, &shared, &sender);
+        worker(0, &table, &patterns, &mode, &shared, &sender);
         drop(sender);
         assert!(receiver.recv().is_err());
     }
@@ -951,11 +1060,11 @@ mod tests {
     fn random_hits_from_one_worker_are_unlinkable() {
         let table = g_table(64);
         let patterns = PatternSet::parse(&["sp1qq?q".to_string()], Network::Mainnet).unwrap();
-        let shared = Shared::default();
+        let shared = Shared::new(1);
         let (sender, receiver) = mpsc::channel();
         let mut secrets = Vec::new();
         thread::scope(|scope| {
-            scope.spawn(|| worker(&table, &patterns, &Mode::Random, &shared, &sender));
+            scope.spawn(|| worker(0, &table, &patterns, &Mode::Random, &shared, &sender));
             for _ in 0..4 {
                 let Ok(found) = receiver.recv().unwrap() else {
                     panic!("worker reported an error");

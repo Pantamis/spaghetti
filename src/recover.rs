@@ -7,7 +7,7 @@
 //! machinery as the key search (generator `−m·G`, base `Q`) and look every
 //! visited x up in the table: `x(Q − i·m·G) = x(j·G)` means `t = i·m ± j`.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -16,21 +16,11 @@ use k256::elliptic_curve::Group;
 use k256::{ProjectivePoint, Scalar};
 
 use crate::field::Fe;
-use crate::search::{Table, Visit, Walk, affine_xy};
-use crate::tweak::{Tweak, lambda_pow};
+use crate::search::{Counter, Table, Visit, Walk, affine_xy};
+use crate::tweak::{Tweak, VARIANTS, lambda_pow};
 
 const MIN_BABY_BITS: u32 = 4;
 const MAX_BABY_BITS: u32 = 28;
-
-/// The six `(e, s)` variants, in search order.
-const VARIANTS: [(u8, bool); 6] = [
-    (0, false),
-    (0, true),
-    (1, false),
-    (1, true),
-    (2, false),
-    (2, true),
-];
 
 #[derive(Clone, Copy, Debug)]
 pub struct Params {
@@ -181,7 +171,7 @@ fn query(
     negate: bool,
 ) -> ProjectivePoint {
     let signed = if negate { -*target } else { *target };
-    signed * lambda_pow((3 - endo % 3) % 3) - base
+    signed * lambda_pow(3 - endo % 3) - base
 }
 
 /// Giant-step index ranges searched in turn: `[0, 2^8)`, `[2^8, 2^16)`, … so
@@ -273,7 +263,8 @@ impl<'a> Giant<'a> {
         let chunk = span.div_ceil(self.threads as u64);
         let batches = chunk.div_ceil(self.table.step());
         let stop = AtomicBool::new(false);
-        let done = AtomicU64::new(0);
+        // One progress counter per thread (see `Counter`).
+        let done: Vec<Counter> = (0..self.threads).map(|_| Counter::default()).collect();
         let (sender, receiver) = mpsc::channel::<u64>();
         let mut result = None;
         thread::scope(|scope| {
@@ -283,7 +274,7 @@ impl<'a> Giant<'a> {
                     break;
                 }
                 let sender = sender.clone();
-                let (stop, done) = (&stop, &done);
+                let (stop, done) = (&stop, &done[thread as usize]);
                 scope.spawn(move || {
                     let k0 = start + self.table.half as u64;
                     if let Some(t) = self.walk(q, k0, batches, stop, done) {
@@ -299,7 +290,7 @@ impl<'a> Giant<'a> {
                         break;
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => {
-                        progress(done.load(Ordering::Relaxed).min(span));
+                        progress(done.iter().map(Counter::get).sum::<u64>().min(span));
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
@@ -317,7 +308,7 @@ impl<'a> Giant<'a> {
         mut k0: u64,
         batches: u64,
         stop: &AtomicBool,
-        done: &AtomicU64,
+        done: &Counter,
     ) -> Option<u64> {
         let table = &self.table;
         let mut walk = Walk::new(table, Scalar::from(k0), *q);
@@ -366,7 +357,7 @@ impl<'a> Giant<'a> {
                     }
                 });
             }
-            done.fetch_add(table.step(), Ordering::Relaxed);
+            done.add(table.step());
             k0 += table.step();
             if let Some(t) = hits.iter().min() {
                 return Some(*t);

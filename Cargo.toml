@@ -25,6 +25,11 @@ k256 = { version = "0.14.0", default-features = false, features = ["arithmetic",
 sha2 = "0.11.0"
 zeroize = "1.9.0"
 
+[features]
+# AArch64 inline assembly for the field arithmetic (src/field/aarch64.rs); the
+# only `unsafe`. Measured level with the portable code on Apple M3.
+asm = []
+
 [dev-dependencies]
 num-bigint = "0.5.1"
 num-traits = "0.2.19"

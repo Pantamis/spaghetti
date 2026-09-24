@@ -83,7 +83,7 @@ struct Cli {
     quiet: bool,
 
     /// half-batch size H (2H points per inversion)
-    #[arg(long, value_name = "N", default_value_t = 1024, hide = true)]
+    #[arg(long, value_name = "N", default_value_t = 4096, hide = true)]
     batch: usize,
 }
 
@@ -279,7 +279,7 @@ impl Search {
         if !self.quiet {
             self.announce();
         }
-        let shared = Shared::default();
+        let shared = Shared::new(self.threads);
         let (sender, receiver) = mpsc::channel();
         let started = Instant::now();
         let mut result = Ok(());
@@ -289,7 +289,7 @@ impl Search {
                 let (table, patterns, mode, shared) =
                     (&self.table, &self.patterns, &self.mode, &shared);
                 let spawned = thread::Builder::new().spawn_scoped(scope, move || {
-                    search::worker(table, patterns, mode, shared, &sender)
+                    search::worker(thread, table, patterns, mode, shared, &sender)
                 });
                 if let Err(e) = spawned {
                     result = Err(format!(
@@ -324,7 +324,7 @@ impl Search {
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(found)) => {
                     let elapsed = started.elapsed();
-                    let tested = shared.tested.load(Ordering::Relaxed);
+                    let tested = shared.tested();
                     status.clear();
                     let addr = address::encode(self.network.hrp(), &found.pubkey, &self.spend);
                     if let Err(message) = final_check(&addr, &found, &self.patterns) {
@@ -372,7 +372,7 @@ impl Search {
             if !self.quiet && last_progress.elapsed() >= Duration::from_secs(1) {
                 last_progress = Instant::now();
                 status.show(&progress_text(
-                    shared.tested.load(Ordering::Relaxed),
+                    shared.tested(),
                     self.expected(),
                     started.elapsed(),
                 ));
