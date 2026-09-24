@@ -88,8 +88,8 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 4096, hide = true)]
     batch: usize,
 
-    /// search on the GPU (Apple Metal); CPU worker threads are then only spawned
-    /// with an explicit -c
+    /// search on the GPU (Apple Metal) as well as on -c CPU threads [default with --gpu:
+    /// available_parallelism - 2; -c 0 for the GPU alone]
     #[cfg(feature = "gpu")]
     #[arg(long)]
     gpu: bool,
@@ -233,12 +233,13 @@ impl Search {
             None => ProjectivePoint::GENERATOR * search::random_scalar()?,
         };
         let gpu = gpu_config(&cli)?;
-        // With the GPU, CPU workers are opt-in (`-c`): the host thread that
-        // drives the GPU should not compete with them.
-        let cores = if gpu.is_some() && cli.cores.is_none() {
-            0
-        } else {
-            thread_count(cli.cores)?
+        // With the GPU, CPU workers still help (about +25% on an M3 Pro) but
+        // the GPU driver and the collector need a core each: default to two
+        // fewer than the machine has, and let `-c 0` mean none.
+        let cores = match (gpu.is_some(), cli.cores) {
+            (true, None) => thread_count(None)?.saturating_sub(2),
+            (true, Some(0)) => 0,
+            (_, cores) => thread_count(cores)?,
         };
         check_batch(cli.batch)?;
         if cli.count == 0 {

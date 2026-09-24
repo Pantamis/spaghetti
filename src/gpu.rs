@@ -44,8 +44,10 @@ const SOURCE: &str = include_str!("gpu/search.metal");
 
 /// Default number of walks (GPU threads).
 pub const DEFAULT_THREADS: usize = 1 << 15;
-/// Default half-batch `H` of a GPU walk (2H points per inversion).
-pub const DEFAULT_HALF: usize = 512;
+/// Default half-batch `H` of a GPU walk (2H points per inversion). Measured
+/// on an M3 Pro: 32768 walks × H = 1024 is the plateau (H = 512 costs 2-3%,
+/// 16384 walks 6%, 65536 walks gain nothing), about 1.1 GB of scratch.
+pub const DEFAULT_HALF: usize = 1024;
 /// Walk count bounds: a power of two so split-mode ranges divide evenly.
 pub const MIN_THREADS: usize = 1 << 5;
 pub const MAX_THREADS: usize = 1 << 20;

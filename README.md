@@ -26,7 +26,7 @@ spaghetti -s 02…33-byte-hex pasta   # render the example address with a real s
 spaghetti -b 02…33-byte-hex pasta   # split-key mode: seed-recoverable key (see below)
 spaghetti --xpub xpub6… pasta       # same, base key from the xpub of m/352'/0'/0'/1'
 spaghetti --output key.txt pasta    # secret goes to a new 0600 file, not to the terminal
-spaghetti --gpu farfalle            # search on the GPU (build with --features gpu; --gpu -c 8 adds 8 CPU threads)
+spaghetti --gpu farfalle            # GPU + CPU threads (build with --features gpu; -c 0 for the GPU alone)
 spaghetti recover --address sp1qq… -b 02…   # find the tweak of a published address
 spaghetti apply --scan-priv-file d.hex --tweak 48213946821/1/-   # wallet scan key (- = stdin)
 ```
@@ -37,8 +37,9 @@ spaghetti [OPTIONS] <PATTERN>...
   <PATTERN>...  address prefix, full (sp1qq?pasta) or bare (pasta = sp1qq?pasta); ? = any char
   -n, --network <NETWORK>      mainnet (hrp sp) | testnet, signet (hrp tsp, the BIP352 hrp for both) |
                                regtest (hrp sprt) [default: mainnet]
-  -c, --cores <N>              OS threads, at most 1024 [default: available_parallelism, or 0 with --gpu]
-      --gpu                    search on the Apple GPU (Metal); only in builds with --features gpu
+  -c, --cores <N>              OS threads, at most 1024 [default: available_parallelism; with --gpu:
+                               available_parallelism - 2, and -c 0 runs the GPU alone]
+      --gpu                    search on the Apple GPU (Metal) as well; only in builds with --features gpu
   -k, --count <N>              stop after N matches [default: 1]
   -s, --spend-pubkey <HEX33>   spend public key used to render the example address (random throwaway one if omitted)
   -b, --base-pubkey <HEX33>    split-key mode: search offsets from this compressed scan pubkey D
@@ -139,7 +140,21 @@ Expected candidates = `2^(constrained x bits)` = `32^n` for `n` fixed chars afte
 
 The search is memoryless: the ETA in the progress line is `(expected − tested) / rate`, but the true expected remaining time is always `expected / rate` regardless of how long you have already searched.
 
-**GPU.** With `--gpu` (feature `gpu`, macOS) the same search runs as a Metal compute kernel. Measured on an Apple M3 Pro (18-core GPU): **~1.9 G x-candidates/s**, against 413 M/s for its 12 CPU threads; `--gpu -c 12` runs both and reaches ~2.2 G/s. The default configuration (32768 walks of batch 1024, hidden options `--gpu-threads` and `--gpu-batch`) uses about 540 MB of GPU memory for the prefix products; halve `--gpu-threads` to halve it at a cost of some 10% in rate.
+**GPU.** With `--gpu` (feature `gpu`, macOS) the same search also runs as a Metal compute kernel. Measured on an Apple M3 Pro (18-core GPU, 6P+6E CPU), interleaved 9 s runs, `farfalle7xx`:
+
+| configuration | rate |
+| ------------- | ---- |
+| CPU only, 12 threads | 413 M/s |
+| GPU alone (`-c 0`), 16384 walks × H 1024 | 1.85 G/s |
+| GPU alone, 32768 walks × H 512 | 1.90–1.94 G/s |
+| GPU alone, 32768 walks × H 1024 (default) | 1.94–1.99 G/s |
+| GPU alone, 65536 walks | no better |
+| GPU + 4 CPU threads | 2.17–2.29 G/s |
+| GPU + 8 CPU threads | 2.30–2.33 G/s |
+| GPU + 10 CPU threads (default) | 2.35–2.43 G/s |
+| GPU + 12 CPU threads | 2.31–2.36 G/s |
+
+The default (`--gpu` with no `-c`) is therefore the GPU plus two fewer CPU threads than the machine has, leaving a core to the GPU driver and one to the collector. The GPU configuration (hidden `--gpu-threads` and `--gpu-batch`) uses about 1.1 GB of GPU memory for the prefix products; `--gpu-batch 512` halves it for 2–3% of the rate, `--gpu-threads 16384` halves it again for another 5%.
 
 ## How it works
 
