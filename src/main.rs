@@ -158,8 +158,8 @@ struct RecoverArgs {
     #[arg(short, long, value_name = "N")]
     cores: Option<usize>,
 
-    /// baby-step table size 2^K (≈ 15 bytes × 2^K: 22 → 60 MB; each +1 halves the giant-step work)
-    #[arg(long, value_name = "K", default_value_t = 22)]
+    /// baby-step table size 2^K (≈ 15 bytes × 2^K: 24 → 240 MB; each +1 halves the giant-step work)
+    #[arg(long, value_name = "K", default_value_t = 24)]
     baby_bits: u32,
 
     /// half-batch size H (2H points per inversion)
@@ -347,7 +347,7 @@ impl Search {
                 String::new()
             }
         );
-        // Split-key mode covers every offset below 2^52 whatever the thread
+        // Split-key mode covers every offset below 2^MAX_TWEAK_BITS whatever the thread
         // count: warn when the pattern is expected to need more than a quarter.
         let coverage = self.split_coverage();
         if matches!(self.mode, Mode::Split { .. }) && self.expected() * 4.0 > coverage {

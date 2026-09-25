@@ -815,7 +815,7 @@ mod tests {
     }
 
     /// Split mode: every reported tweak reproduces the address from the base
-    /// key, offsets stay below 2^52, and the walks stop at their spans.
+    /// key, offsets stay below 2^MAX_TWEAK_BITS, and the walks stop at their spans.
     #[test]
     fn split_mode_worker_reports_valid_tweaks() {
         let cfg = Config {

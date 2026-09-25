@@ -9,9 +9,12 @@ use std::sync::LazyLock;
 use k256::elliptic_curve::PrimeField;
 use k256::{ProjectivePoint, Scalar};
 
-/// Upper bound on every published tweak offset: `2^52`. The search only visits
-/// offsets below it, and `recover` only scans below it.
-pub const MAX_TWEAK_BITS: u32 = 52;
+/// Upper bound on every published tweak offset: `2^58`. The search only visits
+/// offsets below it, and `recover` only scans below it. Split mode then covers
+/// about `3·2^58` candidates, enough for 11-character prefixes (`2^57`) with
+/// a 0.25% chance of exhaustion; `recover` pays for it with `2^(58−K)` giant
+/// steps per variant (about 8 minutes worst case at the default `K = 24`).
+pub const MAX_TWEAK_BITS: u32 = 58;
 
 /// The secp256k1 GLV scalar λ: λ·(x, y) = (β·x, y), λ³ = 1, big-endian
 /// (`0x5363ad4c…1b23bd72`).
@@ -163,7 +166,7 @@ mod tests {
             "5/0/*",
             "-5/0/+",
             "5_000/0/+",
-            "4503599627370496/0/+",
+            &format!("{}/0/+", 1u64 << MAX_TWEAK_BITS),
             "x/0/+",
             "5/0/",
         ] {

@@ -1071,10 +1071,13 @@ mod tests {
         assert!(resolve(&candidate, &Mode::Split { base }).is_err());
         // Split mode rejects offsets that do not fit the tweak range.
         let big = Candidate {
-            k0: Zeroizing::new(Scalar::from(1u64 << 52)),
+            k0: Zeroizing::new(Scalar::from(1u64 << MAX_TWEAK_BITS)),
             offset: 0,
             endo: 0,
-            x: affine_xy(&(base + ProjectivePoint::GENERATOR * Scalar::from(1u64 << 52))).0,
+            x: affine_xy(
+                &(base + ProjectivePoint::GENERATOR * Scalar::from(1u64 << MAX_TWEAK_BITS)),
+            )
+            .0,
             pattern: &patterns.patterns[0],
         };
         let Err(err) = resolve(&big, &Mode::Split { base }) else {
