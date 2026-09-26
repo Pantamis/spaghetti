@@ -14,8 +14,10 @@
 //! batch index within the dispatch, the signed offset and the endomorphism
 //! power (plus the claimed x, which the host checks).
 //!
-//! `unsafe` is confined to reading and writing the shared-memory Metal buffers
-//! between dispatches, see [`Engine::slice`] and [`Engine::slice_mut`].
+//! `unsafe` is confined to the Metal glue at the bottom of this file: reading
+//! and writing the shared-memory buffers between dispatches ([`contents`])
+//! and the two binding calls that take a raw pointer ([`buffer_with`],
+//! [`Pass::bytes`]).
 
 #[cfg(not(target_os = "macos"))]
 compile_error!("the `gpu` feature needs macOS: the search kernel is Metal");
@@ -27,12 +29,17 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use std::ptr::NonNull;
+
 use k256::elliptic_curve::Group;
 use k256::{ProjectivePoint, Scalar};
-use metal::objc::rc::autoreleasepool;
-use metal::{
-    Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, MTLCommandBufferStatus,
-    MTLResourceOptions, MTLSize,
+use objc2::rc::{Retained, autoreleasepool};
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder, MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice,
+    MTLLibrary, MTLResourceOptions, MTLSize,
 };
 use zeroize::Zeroizing;
 
@@ -117,7 +124,7 @@ pub fn split_coverage(cfg: &Config) -> f64 {
 
 /// Name of the default Metal device, for the start-up banner.
 pub fn device_name() -> Result<String, String> {
-    Device::system_default()
+    MTLCreateSystemDefaultDevice()
         .map(|d| d.name().to_string())
         .ok_or_else(|| "no Metal device".to_string())
 }
@@ -177,8 +184,8 @@ fn from_limbs(limbs: &Limbs) -> Option<Fe> {
 
 /// The compiled kernel and its buffers.
 struct Engine {
-    queue: CommandQueue,
-    pipeline: ComputePipelineState,
+    queue: Queue,
+    pipeline: Pipeline,
     /// `n` entries of `(x, y)` limbs: the walk centres.
     centres: Buffer,
     /// `(H+1)` entries of `(x, y)` limbs: `j·G` for `j = 1..=H`, then the jump.
@@ -196,14 +203,14 @@ struct Engine {
     n: usize,
     half: usize,
     nkeys: u32,
-    threadgroup: u64,
+    threadgroup: usize,
 }
 
 impl Engine {
     fn new(cfg: &Config, table: &Table, patterns: &PatternSet) -> Result<Engine, String> {
         cfg.check()?;
-        let device = Device::system_default().ok_or("no Metal device")?;
-        let budget = device.recommended_max_working_set_size();
+        let device = MTLCreateSystemDefaultDevice().ok_or("no Metal device")?;
+        let budget = device.recommendedMaxWorkingSetSize();
         if budget > 0 && cfg.scratch_bytes() > budget / 2 {
             return Err(format!(
                 "GPU scratch would take {} MB, more than half of the device's {} MB; lower \
@@ -212,23 +219,13 @@ impl Engine {
                 budget >> 20
             ));
         }
-        let options = CompileOptions::new();
-        let library = device
-            .new_library_with_source(SOURCE, &options)
-            .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
-        let function = library
-            .get_function("search", None)
-            .map_err(|e| format!("Metal kernel not found: {e}"))?;
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(|e| format!("Metal pipeline creation failed: {e}"))?;
+        let pipeline = compile(&device, "search")?;
         // Two SIMD groups per threadgroup measured best (32..256 tried).
-        let width = pipeline.thread_execution_width().max(1);
-        let threadgroup = (2 * width).min(pipeline.max_total_threads_per_threadgroup());
+        let width = pipeline.threadExecutionWidth().max(1);
+        let threadgroup = (2 * width).min(pipeline.maxTotalThreadsPerThreadgroup());
 
         let n = cfg.threads;
         let half = cfg.half;
-        let shared = MTLResourceOptions::StorageModeShared;
         let mut points: Vec<Limbs> = Vec::with_capacity(2 * (half + 1));
         for j in 0..half {
             let (x, y) = table.point(j);
@@ -249,16 +246,18 @@ impl Engine {
             })
             .collect();
         let engine = Engine {
-            queue: device.new_command_queue(),
+            queue: device
+                .newCommandQueue()
+                .ok_or("Metal command queue creation failed")?,
             pipeline,
-            centres: device.new_buffer((n * size_of::<[Limbs; 2]>()) as u64, shared),
-            table: buffer_with(&device, &points),
-            scratch: device.new_buffer(cfg.scratch_bytes(), shared),
-            keys: buffer_with(&device, &keys),
-            hits: device.new_buffer((HIT_CAPACITY * size_of::<Hit>()) as u64, shared),
-            counters: device.new_buffer((2 * size_of::<u32>()) as u64, shared),
-            remaining: device.new_buffer((n * size_of::<u32>()) as u64, shared),
-            flags: device.new_buffer((n * size_of::<u32>()) as u64, shared),
+            centres: new_buffer(&device, n * size_of::<[Limbs; 2]>())?,
+            table: buffer_with(&device, &points)?,
+            scratch: new_buffer(&device, cfg.scratch_bytes() as usize)?,
+            keys: buffer_with(&device, &keys)?,
+            hits: new_buffer(&device, HIT_CAPACITY * size_of::<Hit>())?,
+            counters: new_buffer(&device, 2 * size_of::<u32>())?,
+            remaining: new_buffer(&device, n * size_of::<u32>())?,
+            flags: new_buffer(&device, n * size_of::<u32>())?,
             n,
             half,
             nkeys: keys.len() as u32,
@@ -268,26 +267,19 @@ impl Engine {
         Ok(engine)
     }
 
-    /// The contents of a shared buffer as a slice of `len` plain values.
-    ///
-    /// Sound because every buffer is `StorageModeShared` (host-visible),
-    /// outlives the returned borrow (it is owned by `self`), holds at least
-    /// `len` values of `T` by construction (the callers pass the length the
-    /// buffer was created with) and is only accessed between dispatches, after
-    /// `wait_until_completed`, so the GPU never writes it concurrently. `T` is
-    /// a plain integer or `#[repr(C)]` aggregate of integers for which every
-    /// bit pattern is valid, and Metal buffers are at least 16-byte aligned.
+    /// The contents of one of the engine's buffers, see [`contents`]: only
+    /// called between dispatches, and never twice on one buffer at a time.
     fn slice<T: Copy>(&self, buffer: &Buffer) -> &[T] {
-        let len = buffer.length() as usize / size_of::<T>();
-        // SAFETY: see above.
-        unsafe { std::slice::from_raw_parts(buffer.contents() as *const T, len) }
+        let (ptr, len) = contents::<T>(buffer);
+        // SAFETY: see `contents`; the buffer is owned by `self`.
+        unsafe { std::slice::from_raw_parts(ptr, len) }
     }
 
     #[allow(clippy::mut_from_ref)]
     fn slice_mut<T: Copy>(&self, buffer: &Buffer) -> &mut [T] {
-        let len = buffer.length() as usize / size_of::<T>();
-        // SAFETY: as for `slice`; callers never hold two slices of one buffer.
-        unsafe { std::slice::from_raw_parts_mut(buffer.contents() as *mut T, len) }
+        let (ptr, len) = contents::<T>(buffer);
+        // SAFETY: see `contents`; callers never hold two slices of one buffer.
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
     }
 
     /// Runs up to `batches` batches on every walk (bounded per walk by
@@ -303,35 +295,23 @@ impl Engine {
             first_only: u32::from(first_only),
         };
         self.slice_mut::<u32>(&self.counters).fill(0);
-        autoreleasepool(|| {
-            let command = self.queue.new_command_buffer();
-            let encoder = command.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&self.pipeline);
-            encoder.set_buffer(0, Some(&self.centres), 0);
-            encoder.set_buffer(1, Some(&self.table), 0);
-            encoder.set_buffer(2, Some(&self.scratch), 0);
-            encoder.set_bytes(
-                3,
-                size_of::<Params>() as u64,
-                (&params as *const Params).cast::<c_void>(),
-            );
-            encoder.set_buffer(4, Some(&self.keys), 0);
-            encoder.set_buffer(5, Some(&self.hits), 0);
-            encoder.set_buffer(6, Some(&self.counters), 0);
-            encoder.set_buffer(7, Some(&self.remaining), 0);
-            encoder.set_buffer(8, Some(&self.flags), 0);
-            encoder.dispatch_threads(
-                MTLSize::new(self.n as u64, 1, 1),
-                MTLSize::new(self.threadgroup, 1, 1),
-            );
-            encoder.end_encoding();
-            command.commit();
-            command.wait_until_completed();
-            match command.status() {
-                MTLCommandBufferStatus::Completed => Ok(()),
-                status => Err(format!("GPU command buffer failed: {status:?}")),
-            }
-        })
+        run_pass(
+            &self.queue,
+            &self.pipeline,
+            self.n,
+            self.threadgroup,
+            |pass| {
+                pass.buffer(0, &self.centres);
+                pass.buffer(1, &self.table);
+                pass.buffer(2, &self.scratch);
+                pass.bytes(3, &params);
+                pass.buffer(4, &self.keys);
+                pass.buffer(5, &self.hits);
+                pass.buffer(6, &self.counters);
+                pass.buffer(7, &self.remaining);
+                pass.buffer(8, &self.flags);
+            },
+        )
     }
 
     /// Hit records of the last dispatch (clamped to the buffer capacity) and
@@ -348,12 +328,133 @@ impl Engine {
     }
 }
 
-fn buffer_with<T: Copy>(device: &Device, data: &[T]) -> Buffer {
-    device.new_buffer_with_data(
-        data.as_ptr().cast::<c_void>(),
-        std::mem::size_of_val(data) as u64,
-        MTLResourceOptions::StorageModeShared,
+// ---- Metal glue (objc2-metal) -----------------------------------------------
+
+type Device = Retained<ProtocolObject<dyn MTLDevice>>;
+type Buffer = Retained<ProtocolObject<dyn MTLBuffer>>;
+type Queue = Retained<ProtocolObject<dyn MTLCommandQueue>>;
+type Pipeline = Retained<ProtocolObject<dyn MTLComputePipelineState>>;
+
+/// Compiles the shader source and builds the pipeline of kernel `name`.
+fn compile(device: &Device, name: &str) -> Result<Pipeline, String> {
+    let library = device
+        .newLibraryWithSource_options_error(&NSString::from_str(SOURCE), None)
+        .map_err(|e| format!("Metal shader compilation failed: {e}"))?;
+    let function = library
+        .newFunctionWithName(&NSString::from_str(name))
+        .ok_or_else(|| format!("Metal kernel `{name}` not found"))?;
+    device
+        .newComputePipelineStateWithFunction_error(&function)
+        .map_err(|e| format!("Metal pipeline creation failed: {e}"))
+}
+
+/// A host-visible (`StorageModeShared`) buffer of `bytes` bytes.
+fn new_buffer(device: &Device, bytes: usize) -> Result<Buffer, String> {
+    device
+        .newBufferWithLength_options(bytes.max(1), MTLResourceOptions::StorageModeShared)
+        .ok_or_else(|| format!("Metal buffer allocation of {bytes} bytes failed"))
+}
+
+/// A host-visible buffer initialised with `data`.
+fn buffer_with<T: Copy>(device: &Device, data: &[T]) -> Result<Buffer, String> {
+    let bytes = std::mem::size_of_val(data);
+    if bytes == 0 {
+        return new_buffer(device, 0);
+    }
+    // SAFETY: `data` is a live slice of `bytes` bytes; Metal copies it before
+    // returning (the buffer does not alias the slice afterwards).
+    unsafe {
+        device.newBufferWithBytes_length_options(
+            NonNull::from(data).cast::<c_void>(),
+            bytes,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+    .ok_or_else(|| format!("Metal buffer allocation of {bytes} bytes failed"))
+}
+
+/// Pointer to, and element count of, a shared buffer's contents as values of
+/// `T`.
+///
+/// Dereferencing it (see `Engine::slice`) is sound because every buffer here
+/// is `StorageModeShared` (host-visible), outlives the borrow (owned by the
+/// caller), holds whole values of `T` (the callers pass the length the buffer
+/// was created with) and is only accessed between dispatches, after
+/// `waitUntilCompleted`, so the GPU never writes it concurrently. `T` is a
+/// plain integer or `#[repr(C)]` aggregate of integers for which every bit
+/// pattern is valid, and Metal buffers are at least 16-byte aligned.
+fn contents<T: Copy>(buffer: &Buffer) -> (*mut T, usize) {
+    (
+        buffer.contents().as_ptr().cast::<T>(),
+        buffer.length() / size_of::<T>(),
     )
+}
+
+/// The argument table of one compute pass.
+struct Pass<'a> {
+    encoder: &'a ProtocolObject<dyn MTLComputeCommandEncoder>,
+}
+
+impl Pass<'_> {
+    fn buffer(&self, index: usize, buffer: &Buffer) {
+        // SAFETY: a plain argument binding; the buffer outlives the pass.
+        unsafe {
+            self.encoder
+                .setBuffer_offset_atIndex(Some(buffer), 0, index)
+        }
+    }
+
+    /// Binds a small `#[repr(C)]` value by copy.
+    fn bytes<T: Copy>(&self, index: usize, value: &T) {
+        // SAFETY: Metal copies `size_of::<T>()` bytes from a live reference.
+        unsafe {
+            self.encoder.setBytes_length_atIndex(
+                NonNull::from(value).cast::<c_void>(),
+                size_of::<T>(),
+                index,
+            )
+        }
+    }
+}
+
+/// Encodes one dispatch of `pipeline` over `threads` threads in threadgroups
+/// of `threadgroup`, with the arguments `bind` sets, and waits for it.
+fn run_pass(
+    queue: &Queue,
+    pipeline: &Pipeline,
+    threads: usize,
+    threadgroup: usize,
+    bind: impl FnOnce(&Pass),
+) -> Result<(), String> {
+    autoreleasepool(|_| {
+        let command = queue
+            .commandBuffer()
+            .ok_or("Metal command buffer creation failed")?;
+        let encoder = command
+            .computeCommandEncoder()
+            .ok_or("Metal compute encoder creation failed")?;
+        encoder.setComputePipelineState(pipeline);
+        bind(&Pass { encoder: &encoder });
+        encoder.dispatchThreads_threadsPerThreadgroup(
+            MTLSize {
+                width: threads,
+                height: 1,
+                depth: 1,
+            },
+            MTLSize {
+                width: threadgroup,
+                height: 1,
+                depth: 1,
+            },
+        );
+        encoder.endEncoding();
+        command.commit();
+        command.waitUntilCompleted();
+        match command.status() {
+            MTLCommandBufferStatus::Completed => Ok(()),
+            status => Err(format!("GPU command buffer failed: {status:?}")),
+        }
+    })
 }
 
 /// Affine centres `base + k·G` for many `k`, computed on all CPU cores; `None`
@@ -599,7 +700,7 @@ mod tests {
     /// on edge cases and random elements.
     /// CI runners may have no GPU: such tests pass vacuously and say so.
     fn device_or_skip() -> Option<Device> {
-        let device = Device::system_default();
+        let device = MTLCreateSystemDefaultDevice();
         if device.is_none() {
             eprintln!("no Metal device: GPU test skipped");
         }
@@ -611,13 +712,7 @@ mod tests {
         let Some(device) = device_or_skip() else {
             return;
         };
-        let library = device
-            .new_library_with_source(SOURCE, &CompileOptions::new())
-            .expect("shader compiles");
-        let function = library.get_function("field_test", None).unwrap();
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .unwrap();
+        let pipeline = compile(&device, "field_test").expect("shader compiles");
         let p_minus_1 = Fe::ZERO.sub(&Fe::ONE);
         let mut cases: Vec<Fe> = vec![
             Fe::ONE,
@@ -647,28 +742,18 @@ mod tests {
             .map(|(a, b)| [to_limbs(a), to_limbs(b)])
             .collect();
         let count = pairs.len() as u32;
-        let inb = buffer_with(&device, &input);
-        let outb = device.new_buffer(
-            (pairs.len() * 6 * size_of::<Limbs>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        let queue = device.new_command_queue();
-        autoreleasepool(|| {
-            let command = queue.new_command_buffer();
-            let encoder = command.new_compute_command_encoder();
-            encoder.set_compute_pipeline_state(&pipeline);
-            encoder.set_buffer(0, Some(&inb), 0);
-            encoder.set_buffer(1, Some(&outb), 0);
-            encoder.set_bytes(2, 4, (&count as *const u32).cast::<c_void>());
-            encoder.dispatch_threads(MTLSize::new(count as u64, 1, 1), MTLSize::new(32, 1, 1));
-            encoder.end_encoding();
-            command.commit();
-            command.wait_until_completed();
-            assert_eq!(command.status(), MTLCommandBufferStatus::Completed);
-        });
+        let inb = buffer_with(&device, &input).unwrap();
+        let outb = new_buffer(&device, pairs.len() * 6 * size_of::<Limbs>()).unwrap();
+        let queue = device.newCommandQueue().unwrap();
+        run_pass(&queue, &pipeline, pairs.len(), 32, |pass| {
+            pass.buffer(0, &inb);
+            pass.buffer(1, &outb);
+            pass.bytes(2, &count);
+        })
+        .unwrap();
+        let (ptr, len) = contents::<[Limbs; 6]>(&outb);
         // SAFETY: shared buffer, GPU finished, sized for `pairs.len()` results.
-        let out: &[[Limbs; 6]] =
-            unsafe { std::slice::from_raw_parts(outb.contents() as *const _, pairs.len()) };
+        let out: &[[Limbs; 6]] = unsafe { std::slice::from_raw_parts(ptr, len) };
         for ((a, b), got) in pairs.iter().zip(out) {
             let got: Vec<Fe> = got
                 .iter()
@@ -904,27 +989,18 @@ mod bench {
     #[test]
     #[ignore]
     fn report() {
-        let Some(device) = Device::system_default() else {
+        let Some(device) = MTLCreateSystemDefaultDevice() else {
             return;
         };
-        let library = device
-            .new_library_with_source(SOURCE, &CompileOptions::new())
-            .expect("shader compiles");
         for name in ["search", "field_test", "bench"] {
-            let function = library.get_function(name, None).unwrap();
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .unwrap();
+            let pipeline = compile(&device, name).unwrap();
             eprintln!(
                 "{name}: max threads/threadgroup {} (lower = more registers), width {}",
-                pipeline.max_total_threads_per_threadgroup(),
-                pipeline.thread_execution_width()
+                pipeline.maxTotalThreadsPerThreadgroup(),
+                pipeline.threadExecutionWidth()
             );
         }
-        let function = library.get_function("bench", None).unwrap();
-        let pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .unwrap();
+        let pipeline = compile(&device, "bench").unwrap();
         let n: usize = 1 << 17;
         let iters: u32 = 2000;
         let mut data: Vec<[Limbs; 2]> = Vec::with_capacity(n);
@@ -933,8 +1009,8 @@ mod bench {
         for _ in 0..n {
             data.push([to_limbs(&a), to_limbs(&b)]);
         }
-        let buffer = buffer_with(&device, &data);
-        let queue = device.new_command_queue();
+        let buffer = buffer_with(&device, &data).unwrap();
+        let queue = device.newCommandQueue().unwrap();
         for (mode, name) in [
             (0u32, "fe_mul"),
             (1, "fe_sqr"),
@@ -944,18 +1020,12 @@ mod bench {
             let mut best = f64::MAX;
             for _ in 0..3 {
                 let started = Instant::now();
-                autoreleasepool(|| {
-                    let command = queue.new_command_buffer();
-                    let encoder = command.new_compute_command_encoder();
-                    encoder.set_compute_pipeline_state(&pipeline);
-                    encoder.set_buffer(0, Some(&buffer), 0);
-                    encoder.set_bytes(1, 4, (&iters as *const u32).cast::<c_void>());
-                    encoder.set_bytes(2, 4, (&mode as *const u32).cast::<c_void>());
-                    encoder.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(64, 1, 1));
-                    encoder.end_encoding();
-                    command.commit();
-                    command.wait_until_completed();
-                });
+                run_pass(&queue, &pipeline, n, 64, |pass| {
+                    pass.buffer(0, &buffer);
+                    pass.bytes(1, &iters);
+                    pass.bytes(2, &mode);
+                })
+                .unwrap();
                 best = best.min(started.elapsed().as_secs_f64());
             }
             let ops = n as f64 * iters as f64;
