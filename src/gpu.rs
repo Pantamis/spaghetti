@@ -83,7 +83,7 @@ impl Config {
                 self.half
             ));
         }
-        // Split mode: every walk gets 2^44 / threads offsets and needs room
+        // Split mode: every walk gets 2^RANGE_BITS / threads offsets and needs room
         // for at least one batch there.
         if (1u64 << RANGE_BITS) / self.threads as u64 <= 4 * self.half as u64 + 1 {
             return Err("--gpu-threads × --gpu-batch too large for split-key mode".to_string());
@@ -434,6 +434,8 @@ fn run(
     let mut batches: u64 = 4;
     let mut set = vec![0u32; n];
     let mut seen = vec![false; n];
+    // Split mode: the range the walks are sweeping.
+    let mut current: Option<usize> = None;
     loop {
         if shared.stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -448,10 +450,14 @@ fn run(
                     walks.budget.fill(u64::MAX);
                 }
                 Mode::Split { .. } => {
+                    if let Some(done) = current.take() {
+                        shared.mark_done(done);
+                    }
                     let range = shared.next_range();
                     if range >= SPLIT_RANGES {
                         return Ok(());
                     }
+                    current = Some(range);
                     let start = (range as u64) << RANGE_BITS;
                     for (t, k) in walks.k0.iter_mut().enumerate() {
                         *k = Scalar::from(start + t as u64 * cfg.split_span() + cfg.half as u64);

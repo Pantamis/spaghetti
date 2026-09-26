@@ -25,9 +25,11 @@ use crate::field::Fe;
 use crate::pattern::{Pattern, PatternSet};
 use crate::tweak::{MAX_TWEAK_BITS, Tweak, lambda_pow};
 
-/// Offsets covered by one split-mode range: `2^44`.
-pub const RANGE_BITS: u32 = 44;
-/// Number of split-mode ranges `[i·2^44, (i+1)·2^44)`; together they cover
+/// Offsets covered by one split-mode range: `2^36`, about 86 s of GPU work or
+/// an hour of one CPU thread, so that the ranges in flight (lost on a restart,
+/// see `--from-range`) are a small part of a long search.
+pub const RANGE_BITS: u32 = 36;
+/// Number of split-mode ranges `[i·2^RANGE_BITS, (i+1)·2^RANGE_BITS)`; together they cover
 /// every offset below `2^MAX_TWEAK_BITS`.
 pub const SPLIT_RANGES: usize = 1 << (MAX_TWEAK_BITS - RANGE_BITS);
 
@@ -595,11 +597,19 @@ pub fn split_coverage(half: usize) -> f64 {
     3.0 * per_range * SPLIT_RANGES as f64
 }
 
+/// Nominal x candidates per split-mode range (three per offset): the unit in
+/// which a resumed search's `tested` count is continued and `--resume`
+/// converts a count into a range. The engines leave slightly fewer than
+/// `2^RANGE_BITS` offsets per range untested at its end; this ignores that.
+pub fn split_range_candidates() -> u64 {
+    3 << RANGE_BITS
+}
+
 /// A counter on its own cache line (128 bytes on Apple silicon, 64 elsewhere):
 /// one per worker, written by that worker only, so the per-batch accounting
 /// never writes a line another core is reading. Every other atomic the
 /// workers touch is read-only in steady state (`stop`) or rare (`next_range`,
-/// once per `2^44` offsets), so the batch loop has no cross-core traffic.
+/// once per `2^RANGE_BITS` offsets), so the batch loop has no cross-core traffic.
 #[repr(align(128))]
 #[derive(Default)]
 pub struct Counter(AtomicU64);
@@ -620,22 +630,62 @@ pub struct Shared {
     pub stop: AtomicBool,
     /// x candidates tested so far, one slot per worker.
     tested: Vec<Counter>,
+    /// Candidates credited to a resumed search (`--from-range`): the count
+    /// shown continues where the previous run's stopped.
+    tested_base: u64,
     /// Split mode: next range to hand out.
     next_range: AtomicUsize,
+    /// Split mode: one flag per range, set when a worker has swept it.
+    done: Box<[AtomicBool]>,
+    /// Split mode: every range below this one is done (advanced lazily).
+    done_prefix: AtomicUsize,
 }
 
 impl Shared {
-    pub fn new(threads: usize) -> Shared {
+    /// Random mode (or a split search from range 0).
+    pub fn new(workers: usize) -> Shared {
+        Self::split(workers, 0)
+    }
+
+    /// Split mode from range `from` on; ranges below it count as done.
+    pub fn split(workers: usize, from: usize) -> Shared {
+        let from = from.min(SPLIT_RANGES);
         Shared {
             stop: AtomicBool::new(false),
-            tested: (0..threads).map(|_| Counter::default()).collect(),
-            next_range: AtomicUsize::new(0),
+            tested: (0..workers).map(|_| Counter::default()).collect(),
+            tested_base: from as u64 * split_range_candidates(),
+            next_range: AtomicUsize::new(from),
+            done: (0..SPLIT_RANGES)
+                .map(|range| AtomicBool::new(range < from))
+                .collect(),
+            done_prefix: AtomicUsize::new(from),
         }
     }
 
-    /// x candidates tested so far by all workers.
+    /// x candidates tested so far by all workers (plus the resumed base).
     pub fn tested(&self) -> u64 {
+        self.tested_base + self.tested_here()
+    }
+
+    /// x candidates tested by this run alone: what the rate is made of.
+    pub fn tested_here(&self) -> u64 {
         self.tested.iter().map(Counter::get).sum()
+    }
+
+    /// Split mode: a worker swept every offset of `range`.
+    pub fn mark_done(&self, range: usize) {
+        self.done[range].store(true, Ordering::Release);
+    }
+
+    /// Split mode: the first range not yet swept; every range below it is,
+    /// so a later run can `--from-range` here without losing coverage.
+    pub fn done_prefix(&self) -> usize {
+        let mut prefix = self.done_prefix.load(Ordering::Relaxed);
+        while prefix < SPLIT_RANGES && self.done[prefix].load(Ordering::Acquire) {
+            prefix += 1;
+        }
+        self.done_prefix.store(prefix, Ordering::Relaxed);
+        prefix
     }
 
     /// The progress counter of worker `index`.
@@ -657,9 +707,10 @@ impl Shared {
 /// Random mode walks from a random start and, after a hit, reports only that
 /// hit and reseeds, so two keys from one run are never related by a small
 /// public offset (which would let anyone prove common ownership and turn one
-/// secret into the other). Split mode takes ranges `[i·2^44, (i+1)·2^44)` from
-/// the shared queue; a range starts at `i·2^44 + H` so its first batch visits
-/// `i·2^44 ..= i·2^44 + 2H`, and stops before a batch would cross the range end.
+/// secret into the other). Split mode takes ranges `[i·2^R, (i+1)·2^R)`
+/// (`R = RANGE_BITS`) from the shared queue; a range starts at `i·2^R + H` so
+/// its first batch visits `i·2^R ..= i·2^R + 2H`, stops before a batch would
+/// cross the range end, and is then marked done.
 pub fn worker(
     index: usize,
     table: &Table,
@@ -736,6 +787,7 @@ fn run<K: Keys>(
                     }
                 }
             }
+            shared.mark_done(range);
         },
     }
 }
@@ -943,7 +995,7 @@ mod tests {
         );
         assert_eq!(scalar_to_u64(&Scalar::ONE.negate()), None);
         assert_eq!(split_start(0, 1024), 1024);
-        assert_eq!(split_start(3, 1024), 3 * (1 << 44) + 1024);
+        assert_eq!(split_start(3, 1024), 3 * (1 << RANGE_BITS) + 1024);
         // The last batch of a range stays inside it, and no full batch is left out.
         for half in [1024usize, 64, 8, 1] {
             let batches = split_batches(half);
@@ -1084,6 +1136,26 @@ mod tests {
             panic!("expected an out-of-range error");
         };
         assert!(err.contains("out of range"), "{err}");
+    }
+
+    /// `--from-range` credits the skipped ranges and the done prefix only
+    /// advances over contiguous swept ranges.
+    #[test]
+    fn done_prefix_and_resume_accounting() {
+        let shared = Shared::split(1, 5);
+        assert_eq!(shared.tested(), 5 * split_range_candidates());
+        assert_eq!(shared.done_prefix(), 5);
+        assert_eq!(shared.next_range(), 5);
+        shared.mark_done(7);
+        assert_eq!(shared.done_prefix(), 5);
+        shared.mark_done(5);
+        assert_eq!(shared.done_prefix(), 6);
+        shared.mark_done(6);
+        assert_eq!(shared.done_prefix(), 8);
+        let all = Shared::split(1, SPLIT_RANGES + 10);
+        assert_eq!(all.done_prefix(), SPLIT_RANGES);
+        assert!(all.next_range() >= SPLIT_RANGES);
+        assert_eq!(split_range_candidates(), 3 << RANGE_BITS);
     }
 
     /// Split mode with every range already taken: the worker exits without

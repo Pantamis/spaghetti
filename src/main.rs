@@ -80,6 +80,16 @@ struct Cli {
     #[arg(long, value_name = "PATH")]
     output: Option<PathBuf>,
 
+    /// split-key mode: skip the first N ranges of 2^36 offsets (the progress line of a
+    /// previous run shows the value to pass)
+    #[arg(long, value_name = "N", conflicts_with = "resume")]
+    from_range: Option<usize>,
+
+    /// split-key mode: resume near a previous run's `tested` count, e.g. 126.89T
+    /// (approximate: about an hour of GPU work before it is redone, none is skipped)
+    #[arg(long, value_name = "COUNT")]
+    resume: Option<String>,
+
     /// no progress output
     #[arg(short, long)]
     quiet: bool,
@@ -215,6 +225,8 @@ struct Search {
     table: Table,
     /// CPU worker threads (0 when only the GPU searches).
     threads: usize,
+    /// Split mode: first range to sweep (`--from-range`, `--resume`).
+    from_range: usize,
     #[cfg(feature = "gpu")]
     gpu: Option<gpu::Config>,
     count: u64,
@@ -261,12 +273,40 @@ impl Search {
                     .to_string(),
             );
         }
+        let workers = threads + usize::from(gpu.is_some());
+        let from_range = match (cli.from_range, &cli.resume) {
+            (None, None) => 0,
+            (Some(_), _) | (_, Some(_)) if matches!(mode, Mode::Random) => {
+                return Err(
+                    "--from-range and --resume only apply to split-key mode (-b or --xpub): a \
+                     random-mode search starts from a fresh random point every time"
+                        .to_string(),
+                );
+            }
+            (Some(n), _) if n >= SPLIT_RANGES => {
+                return Err(format!(
+                    "--from-range: there are only {SPLIT_RANGES} ranges, got {n}"
+                ));
+            }
+            (Some(n), _) => n,
+            (None, Some(text)) => {
+                // The count is the sum over ranges in flight as well as done
+                // ones, so back off by what the workers can hold: one range
+                // each, plus what a CPU thread may still hold (about an hour)
+                // while a GPU sweeps ranges at 86 s each.
+                let tested = parse_count(text)?;
+                let ranges = (tested / search::split_range_candidates()) as usize;
+                let skew = if gpu.is_some() { 64 } else { 0 };
+                ranges.saturating_sub(workers + skew)
+            }
+        };
         Ok(Search {
             patterns,
             network,
             mode,
             table: Table::new(cli.batch, ProjectivePoint::GENERATOR),
             threads,
+            from_range,
             #[cfg(feature = "gpu")]
             gpu,
             count: cli.count,
@@ -347,6 +387,13 @@ impl Search {
                 String::new()
             }
         );
+        if self.from_range > 0 {
+            eprintln!(
+                "resuming from range {} of {SPLIT_RANGES} (≈ {} candidates already tested)",
+                self.from_range,
+                human_count((self.from_range as u64 * search::split_range_candidates()) as f64)
+            );
+        }
         // Split-key mode covers every offset below 2^MAX_TWEAK_BITS whatever the thread
         // count: warn when the pattern is expected to need more than a quarter.
         let coverage = self.split_coverage();
@@ -370,7 +417,10 @@ impl Search {
         if !self.quiet {
             self.announce();
         }
-        let shared = Shared::new(self.workers());
+        let shared = match self.mode {
+            Mode::Random => Shared::new(self.workers()),
+            Mode::Split { .. } => Shared::split(self.workers(), self.from_range),
+        };
         let (sender, receiver) = mpsc::channel();
         let started = Instant::now();
         let mut result = Ok(());
@@ -423,6 +473,7 @@ impl Search {
                 Ok(Ok(found)) => {
                     let elapsed = started.elapsed();
                     let tested = shared.tested();
+                    let tested_here = shared.tested_here();
                     status.clear();
                     let addr = address::encode(self.network.hrp(), &found.pubkey, &self.spend);
                     if let Err(message) = final_check(&addr, &found, &self.patterns) {
@@ -434,6 +485,7 @@ impl Search {
                         spend_provided: self.spend_provided,
                         addr: &addr,
                         tested,
+                        tested_here,
                         elapsed,
                     };
                     let mut out = io::stdout().lock();
@@ -469,10 +521,16 @@ impl Search {
             }
             if !self.quiet && last_progress.elapsed() >= Duration::from_secs(1) {
                 last_progress = Instant::now();
+                let resume = match self.mode {
+                    Mode::Random => None,
+                    Mode::Split { .. } => Some(shared.done_prefix()),
+                };
                 status.show(&progress_text(
                     shared.tested(),
+                    shared.tested_here(),
                     self.expected(),
                     started.elapsed(),
+                    resume,
                 ));
             }
         };
@@ -549,7 +607,10 @@ struct Match<'a> {
     spend: &'a [u8; 33],
     spend_provided: bool,
     addr: &'a str,
+    /// Candidates tested in total, earlier runs included (`--from-range`).
     tested: u64,
+    /// Candidates tested by this run: the rate.
+    tested_here: u64,
     elapsed: Duration,
 }
 
@@ -586,14 +647,25 @@ impl Match<'_> {
                 writeln!(out, "address         : {}", self.addr)?;
             }
         }
-        let rate = self.tested as f64 / self.elapsed.as_secs_f64().max(1e-9);
-        writeln!(
-            out,
-            "found after {} candidates in {} ({}/s)",
-            human_count(self.tested as f64),
-            human_duration(self.elapsed.as_secs_f64()),
-            human_count(rate)
-        )?;
+        let rate = self.tested_here as f64 / self.elapsed.as_secs_f64().max(1e-9);
+        if self.tested == self.tested_here {
+            writeln!(
+                out,
+                "found after {} candidates in {} ({}/s)",
+                human_count(self.tested as f64),
+                human_duration(self.elapsed.as_secs_f64()),
+                human_count(rate)
+            )?;
+        } else {
+            writeln!(
+                out,
+                "found after {} candidates, {} of them in this run's {} ({}/s)",
+                human_count(self.tested as f64),
+                human_count(self.tested_here as f64),
+                human_duration(self.elapsed.as_secs_f64()),
+                human_count(rate)
+            )?;
+        }
         writeln!(out)?;
         out.flush()
     }
@@ -861,22 +933,67 @@ impl StatusLine {
     }
 }
 
-fn progress_text(tested: u64, expected: f64, elapsed: Duration) -> String {
+/// `tested` counts earlier runs (`--from-range`), `tested_here` this run only:
+/// the rate is this run's, the remaining work the total's. `resume`: split
+/// mode, the first range not yet swept (what `--from-range` takes to continue
+/// this search later).
+fn progress_text(
+    tested: u64,
+    tested_here: u64,
+    expected: f64,
+    elapsed: Duration,
+    resume: Option<usize>,
+) -> String {
     let secs = elapsed.as_secs_f64().max(1e-9);
-    let rate = tested as f64 / secs;
+    let rate = tested_here as f64 / secs;
     let remaining = (expected - tested as f64).max(0.0);
     let eta = if rate > 0.0 {
         human_duration(remaining / rate)
     } else {
         "∞".to_string()
     };
+    let resume = match resume {
+        Some(range) => format!(" | --from-range {range}"),
+        None => String::new(),
+    };
     format!(
-        "{}/s | tested {} | expected {} | ETA {eta} | elapsed {}",
+        "{}/s | tested {} | expected {} | ETA {eta} | elapsed {}{resume}",
         human_count(rate),
         human_count(tested as f64),
         human_count(expected),
         human_duration(secs)
     )
+}
+
+/// Parses a candidate count as the progress line prints it: an integer, or a
+/// decimal with a K/M/G/T/P/E suffix (`126.89T`, `126.89 T`, `500g`).
+fn parse_count(text: &str) -> Result<u64, String> {
+    let text = text.trim();
+    let (number, unit) = match text.chars().last() {
+        Some(c) if c.is_ascii_alphabetic() => (text[..text.len() - 1].trim_end(), Some(c)),
+        _ => (text, None),
+    };
+    let scale: f64 = match unit.map(|c| c.to_ascii_uppercase()) {
+        None => 1.0,
+        Some('K') => 1e3,
+        Some('M') => 1e6,
+        Some('G') => 1e9,
+        Some('T') => 1e12,
+        Some('P') => 1e15,
+        Some('E') => 1e18,
+        Some(c) => {
+            return Err(format!(
+                "--resume: unknown unit '{c}' in '{text}' (K M G T P E)"
+            ));
+        }
+    };
+    let value: f64 = number
+        .parse()
+        .map_err(|_| format!("--resume: expected a count like 126.89T, got '{text}'"))?;
+    if value.is_nan() || value < 0.0 || value * scale > 1e19 {
+        return Err(format!("--resume: '{text}' is out of range"));
+    }
+    Ok((value * scale) as u64)
 }
 
 fn human_count(value: f64) -> String {
@@ -942,6 +1059,24 @@ mod tests {
         assert_eq!(human_duration(3_661.0), "1h 1m 1s");
         assert_eq!(human_duration(90_000.0), "1d 1h 0m");
         assert!(human_duration(1e12).ends_with("years"));
+    }
+
+    #[test]
+    fn count_parsing() {
+        assert_eq!(parse_count("126.89T").unwrap(), 126_890_000_000_000);
+        assert_eq!(parse_count(" 126.89 T ").unwrap(), 126_890_000_000_000);
+        assert_eq!(parse_count("500g").unwrap(), 500_000_000_000);
+        assert_eq!(parse_count("12345").unwrap(), 12345);
+        assert_eq!(parse_count("1.5 P").unwrap(), 1_500_000_000_000_000);
+        assert!(parse_count("").is_err());
+        assert!(parse_count("12x").is_err());
+        assert!(parse_count("-5T").is_err());
+        assert!(parse_count("1e30").is_err());
+        let text = progress_text(3_000, 1_000, 4_000.0, Duration::from_secs(2), Some(42));
+        assert!(text.starts_with("500/s | tested 3.00 K"), "{text}");
+        assert!(text.contains("ETA 2.0s"), "{text}");
+        assert!(text.ends_with(" | --from-range 42"), "{text}");
+        assert!(!progress_text(1, 1, 1.0, Duration::from_secs(1), None).contains("from-range"));
     }
 
     #[test]
