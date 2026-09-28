@@ -216,6 +216,7 @@ That is a 2^36-offset range every 33 s, and about 8.4 days of one T4 on average 
 
 ```
 BASE=02…33-byte-hex PATTERN=sp1qqgmlnmarkets S3=s3://my-bucket/spaghetti scripts/spot-search.sh
+BASE=02… PATTERN=sprt1qqgmlnmarkets NETWORK=regtest scripts/spot-search.sh   # another network
 ```
 
 It restores the checkpoint, the matches and the tuned parameters from S3 when the local copies are missing (a fresh instance), tunes once per GPU model, runs the search with `--gpu-params` and `--checkpoint`, appends matches to `found.txt`, mirrors the state to S3 every minute, watches the instance metadata for the two-minute spot interruption notice (then stops the search so it saves its checkpoint), and exits 0 once the search is complete. To start it at every boot:

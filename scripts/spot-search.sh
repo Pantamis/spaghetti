@@ -6,6 +6,8 @@
 #   BASE=02…(33-byte hex base scan pubkey) PATTERN=sp1qqgmlnmarkets \
 #   S3=s3://my-bucket/spaghetti scripts/spot-search.sh
 #
+#   BASE=02… PATTERN=sprt1qqgmlnmarkets NETWORK=regtest scripts/spot-search.sh
+#
 # Run it at boot (systemd unit in the README) or by hand in tmux. The first run
 # on a GPU model tunes the engine with `spaghetti bench-gpu` (a few minutes)
 # and keeps the parameters, per GPU model, next to the checkpoint.
@@ -13,16 +15,19 @@
 # Environment:
 #   BASE     base scan pubkey D (or XPUB=xpub6… of m/352'/0'/0'/1')
 #   PATTERN  the vanity pattern(s), space separated   [sp1qqgmlnmarkets]
+#   NETWORK  mainnet | testnet | signet | regtest, for the tuning and the
+#            search alike                             [mainnet]
 #   DIR      state directory (checkpoint, params, matches) [~/spaghetti-run]
 #   S3       optional s3:// prefix the state is mirrored to every minute
 #   BIN      the spaghetti binary built with --features cuda [spaghetti]
-#   EXTRA    extra search arguments, e.g. "-k 3" or "-n signet"
+#   EXTRA    extra search arguments, e.g. "-k 3" (not the network: NETWORK)
 set -euo pipefail
 
 PATTERN=${PATTERN:-sp1qqgmlnmarkets}
 DIR=${DIR:-$HOME/spaghetti-run}
 BIN=${BIN:-spaghetti}
 S3=${S3:-}
+NETWORK=${NETWORK:-mainnet}
 EXTRA=${EXTRA:-}
 if [[ -n ${XPUB:-} ]]; then
     KEY=(--xpub "$XPUB")
@@ -49,12 +54,13 @@ s3_get "$(basename "$PARAMS")" "$PARAMS"
 # shellcheck disable=SC2086 # PATTERN and EXTRA are word lists
 if [[ ! -f $PARAMS ]]; then
     echo "tuning for $GPU_MODEL (once per GPU model)…" >&2
-    "$BIN" bench-gpu --output "$PARAMS" $PATTERN
+    "$BIN" bench-gpu -n "$NETWORK" --output "$PARAMS" $PATTERN
     s3_put "$PARAMS"
 fi
 
 # shellcheck disable=SC2086
-"$BIN" --gpu-params "$PARAMS" --checkpoint "$CKPT" "${KEY[@]}" $EXTRA $PATTERN >>"$FOUND" &
+"$BIN" -n "$NETWORK" --gpu-params "$PARAMS" --checkpoint "$CKPT" "${KEY[@]}" $EXTRA $PATTERN \
+    >>"$FOUND" &
 SEARCH=$!
 
 # Mirror the state to S3 every minute.
