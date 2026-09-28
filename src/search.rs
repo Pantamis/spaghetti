@@ -97,13 +97,13 @@ impl Table {
     }
 
     /// Affine `(x, y)` of `(j+1)·P` for `j < H`.
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub fn point(&self, j: usize) -> (Fe, Fe) {
         (self.x[j], self.y[j])
     }
 
     /// Affine `(x, y)` of the jump `(2H+1)·P`.
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     pub fn jump(&self) -> (Fe, Fe) {
         (self.jump_x, self.jump_y)
     }
@@ -467,7 +467,7 @@ fn push_candidate<'p>(
 /// coordinate of `λ^endo · (k0 + offset) · G` (plus the split-mode base).
 /// `None` when no pattern matches `x` in full; otherwise the same
 /// reconstruction and k256 cross-check as a CPU hit ([`resolve`]).
-#[cfg(feature = "gpu")]
+#[cfg(any(feature = "gpu", feature = "cuda"))]
 pub fn resolve_hit(
     k0: &Scalar,
     offset: i64,
@@ -639,6 +639,10 @@ pub struct Shared {
     done: Box<[AtomicBool]>,
     /// Split mode: every range below this one is done (advanced lazily).
     done_prefix: AtomicUsize,
+    /// Split mode: one past the highest range marked done at start-up
+    /// (resumed from a checkpoint); ranges up to the queue position or this,
+    /// whichever is higher, may be done.
+    resumed_high: usize,
 }
 
 impl Shared {
@@ -649,16 +653,33 @@ impl Shared {
 
     /// Split mode from range `from` on; ranges below it count as done.
     pub fn split(workers: usize, from: usize) -> Shared {
-        let from = from.min(SPLIT_RANGES);
+        Self::resume(workers, from, &[])
+    }
+
+    /// Split mode resumed from a checkpoint: every range below `prefix` and
+    /// every range in `done` counts as done (credited to the tested count)
+    /// and is never handed out again.
+    pub fn resume(workers: usize, prefix: usize, done: &[usize]) -> Shared {
+        let prefix = prefix.min(SPLIT_RANGES);
+        let flags: Box<[AtomicBool]> = (0..SPLIT_RANGES)
+            .map(|range| AtomicBool::new(range < prefix))
+            .collect();
+        let mut credited = prefix;
+        let mut resumed_high = prefix;
+        for &range in done.iter().filter(|&&r| r < SPLIT_RANGES) {
+            if !flags[range].swap(true, Ordering::Relaxed) {
+                credited += 1;
+            }
+            resumed_high = resumed_high.max(range + 1);
+        }
         Shared {
             stop: AtomicBool::new(false),
             tested: (0..workers).map(|_| Counter::default()).collect(),
-            tested_base: from as u64 * split_range_candidates(),
-            next_range: AtomicUsize::new(from),
-            done: (0..SPLIT_RANGES)
-                .map(|range| AtomicBool::new(range < from))
-                .collect(),
-            done_prefix: AtomicUsize::new(from),
+            tested_base: credited as u64 * split_range_candidates(),
+            next_range: AtomicUsize::new(prefix),
+            done: flags,
+            done_prefix: AtomicUsize::new(prefix),
+            resumed_high,
         }
     }
 
@@ -695,8 +716,28 @@ impl Shared {
 
     /// Split mode: takes the next range from the queue (`>= SPLIT_RANGES`
     /// once they are all handed out).
+    /// Ranges already done (resumed from a checkpoint) are skipped.
     pub fn next_range(&self) -> usize {
-        self.next_range.fetch_add(1, Ordering::Relaxed)
+        loop {
+            let range = self.next_range.fetch_add(1, Ordering::Relaxed);
+            if range >= SPLIT_RANGES || !self.done[range].load(Ordering::Acquire) {
+                return range;
+            }
+        }
+    }
+
+    /// Split mode: the done ranges above [`Shared::done_prefix`], ascending:
+    /// with the prefix, everything a checkpoint needs to lose no swept range.
+    pub fn done_above_prefix(&self) -> Vec<usize> {
+        let prefix = self.done_prefix();
+        let high = self
+            .next_range
+            .load(Ordering::Relaxed)
+            .max(self.resumed_high)
+            .min(SPLIT_RANGES);
+        (prefix..high)
+            .filter(|&range| self.done[range].load(Ordering::Acquire))
+            .collect()
     }
 }
 
@@ -1156,6 +1197,28 @@ mod tests {
         assert_eq!(all.done_prefix(), SPLIT_RANGES);
         assert!(all.next_range() >= SPLIT_RANGES);
         assert_eq!(split_range_candidates(), 3 << RANGE_BITS);
+    }
+
+    /// A checkpoint's done ranges above the prefix are credited, skipped by
+    /// the queue and reported again by the snapshot.
+    #[test]
+    fn resume_skips_and_reports_done_ranges() {
+        let shared = Shared::resume(1, 3, &[4, 6, 6, 9]);
+        assert_eq!(shared.tested(), 6 * split_range_candidates());
+        assert_eq!(shared.done_above_prefix(), vec![4, 6, 9]);
+        assert_eq!(shared.next_range(), 3);
+        assert_eq!(shared.next_range(), 5);
+        assert_eq!(shared.next_range(), 7);
+        shared.mark_done(3);
+        assert_eq!(shared.done_prefix(), 5);
+        assert_eq!(shared.done_above_prefix(), vec![6, 9]);
+        shared.mark_done(7);
+        assert_eq!(shared.done_above_prefix(), vec![6, 7, 9]);
+        shared.mark_done(5);
+        assert_eq!(shared.done_prefix(), 8);
+        assert_eq!(shared.done_above_prefix(), vec![9]);
+        assert_eq!(shared.next_range(), 8);
+        assert_eq!(shared.next_range(), 10);
     }
 
     /// Split mode with every range already taken: the worker exits without

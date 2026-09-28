@@ -6,8 +6,16 @@
 
 mod address;
 mod bip32;
+mod checkpoint;
 mod field;
+#[cfg(all(feature = "gpu", feature = "cuda"))]
+compile_error!("features `gpu` (Apple Metal) and `cuda` (NVIDIA) are exclusive");
 #[cfg(feature = "gpu")]
+mod gpu;
+/// The CUDA engine stands in for the Metal one under the same name: the
+/// search drives either through `gpu::Config` and `gpu::worker`.
+#[cfg(feature = "cuda")]
+#[path = "cuda.rs"]
 mod gpu;
 mod pattern;
 mod recover;
@@ -18,8 +26,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::Ordering;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -33,6 +41,8 @@ use pattern::PatternSet;
 use search::{Found, Key, Mode, RANGE_BITS, SPLIT_RANGES, Shared, Table, compressed};
 use tweak::{MAX_TWEAK_BITS, Tweak};
 
+/// How often `--checkpoint` rewrites its file.
+const CHECKPOINT_EVERY: Duration = Duration::from_secs(10);
 /// Upper bound on `-c` (OS threads).
 const MAX_THREADS: usize = 1024;
 /// Upper bound on the hidden `--batch` half size `H` (`2H <= 2^20`).
@@ -90,6 +100,11 @@ struct Cli {
     #[arg(long, value_name = "COUNT")]
     resume: Option<String>,
 
+    /// split-key mode: record the swept ranges in this file (rewritten atomically every
+    /// 10 s, on exit and on SIGTERM/SIGINT/SIGHUP) and, if it exists, continue from it
+    #[arg(long, value_name = "PATH")]
+    checkpoint: Option<PathBuf>,
+
     /// no progress output
     #[arg(short, long)]
     quiet: bool,
@@ -98,40 +113,137 @@ struct Cli {
     #[arg(long, value_name = "N", default_value_t = 4096, hide = true)]
     batch: usize,
 
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
+    #[command(flatten)]
+    gpu: GpuArgs,
+}
+
+#[cfg(feature = "gpu")]
+#[derive(Args)]
+struct GpuArgs {
     /// search on the GPU (Apple Metal) as well as on -c CPU threads [default with --gpu:
     /// available_parallelism - 2; -c 0 for the GPU alone]
-    #[cfg(feature = "gpu")]
     #[arg(long)]
     gpu: bool,
 
     /// GPU walks (threads), a power of two
-    #[cfg(feature = "gpu")]
     #[arg(long, value_name = "N", default_value_t = gpu::DEFAULT_THREADS, hide = true, requires = "gpu")]
     gpu_threads: usize,
 
     /// GPU half-batch size H (2H points per inversion per walk)
-    #[cfg(feature = "gpu")]
     #[arg(long, value_name = "N", default_value_t = gpu::DEFAULT_HALF, hide = true, requires = "gpu")]
     gpu_batch: usize,
 }
 
-/// The GPU configuration requested on the command line, validated.
-#[cfg(feature = "gpu")]
-fn gpu_config(cli: &Cli) -> Result<Option<gpu::Config>, String> {
-    if !cli.gpu {
-        return Ok(None);
-    }
-    let cfg = gpu::Config {
-        threads: cli.gpu_threads,
-        half: cli.gpu_batch,
-    };
-    cfg.check()?;
-    Ok(Some(cfg))
+#[cfg(feature = "cuda")]
+#[derive(Args)]
+struct GpuArgs {
+    /// search on NVIDIA GPUs (CUDA), alone by default; -c N adds CPU threads
+    #[arg(long)]
+    gpu: bool,
+
+    /// GPU parameters tuned by `spaghetti bench-gpu` (implies --gpu; --gpu-* flags and -c
+    /// given explicitly win over the file)
+    #[arg(long, value_name = "PATH")]
+    gpu_params: Option<PathBuf>,
+
+    /// CUDA devices to use, e.g. 0,1,3 [default: all]
+    #[arg(long, value_name = "LIST")]
+    gpu_devices: Option<String>,
+
+    /// GPU walks per device, a multiple of 32 [default: 65536]
+    #[arg(long, value_name = "N")]
+    gpu_threads: Option<usize>,
+
+    /// GPU half-batch size H, 2H points per inversion per walk [default: 1024]
+    #[arg(long, value_name = "N")]
+    gpu_batch: Option<usize>,
+
+    /// CUDA threads per block [default: 128]
+    #[arg(long, value_name = "N")]
+    gpu_block: Option<usize>,
+
+    /// minimum resident blocks per SM asked of the compiler, which caps the registers per
+    /// thread [default: 1]
+    #[arg(long, value_name = "N")]
+    gpu_min_blocks: Option<usize>,
 }
 
-#[cfg(not(feature = "gpu"))]
-fn gpu_config(_cli: &Cli) -> Result<Option<()>, String> {
-    Ok(None)
+/// The GPU configuration requested on the command line, validated, and the
+/// CPU thread count it suggests (`None`: the usual default).
+#[cfg(feature = "gpu")]
+fn gpu_config(cli: &Cli) -> Result<(Option<gpu::Config>, Option<usize>), String> {
+    if !cli.gpu.gpu {
+        return Ok((None, None));
+    }
+    let cfg = gpu::Config {
+        threads: cli.gpu.gpu_threads,
+        half: cli.gpu.gpu_batch,
+    };
+    cfg.check()?;
+    Ok((Some(cfg), None))
+}
+
+/// CUDA: explicit flags, then the `--gpu-params` file, then the defaults. The
+/// suggested CPU thread count is the file's, or none at all: a CPU thread
+/// needs hours per split-key range and adds little next to a data-centre GPU.
+#[cfg(feature = "cuda")]
+fn gpu_config(cli: &Cli) -> Result<(Option<gpu::Config>, Option<usize>), String> {
+    let args = &cli.gpu;
+    if !args.gpu && args.gpu_params.is_none() {
+        let stray = args.gpu_devices.is_some()
+            || args.gpu_threads.is_some()
+            || args.gpu_batch.is_some()
+            || args.gpu_block.is_some()
+            || args.gpu_min_blocks.is_some();
+        if stray {
+            return Err("the --gpu-* options need --gpu (or --gpu-params)".to_string());
+        }
+        return Ok((None, None));
+    }
+    let tuned = match &args.gpu_params {
+        Some(path) => Some(gpu::Tuning::load(path)?),
+        None => None,
+    };
+    let pick =
+        |flag: Option<usize>, file: Option<usize>, default: usize| flag.or(file).unwrap_or(default);
+    let devices = match &args.gpu_devices {
+        Some(list) => gpu::parse_devices(list)?,
+        None => gpu::all_devices()?,
+    };
+    let cfg = gpu::Config {
+        threads: pick(
+            args.gpu_threads,
+            tuned.as_ref().map(|t| t.threads),
+            gpu::DEFAULT_THREADS,
+        ),
+        half: pick(
+            args.gpu_batch,
+            tuned.as_ref().map(|t| t.half),
+            gpu::DEFAULT_HALF,
+        ),
+        block: pick(
+            args.gpu_block,
+            tuned.as_ref().map(|t| t.block),
+            gpu::DEFAULT_BLOCK,
+        ),
+        min_blocks: pick(
+            args.gpu_min_blocks,
+            tuned.as_ref().map(|t| t.min_blocks),
+            gpu::DEFAULT_MIN_BLOCKS,
+        ),
+        devices,
+    };
+    cfg.check()?;
+    if let Some(tuned) = &tuned {
+        tuned.warn_if_other_device(&cfg);
+    }
+    Ok((Some(cfg), Some(tuned.and_then(|t| t.cores).unwrap_or(0))))
+}
+
+#[cfg(not(any(feature = "gpu", feature = "cuda")))]
+fn gpu_config(_cli: &Cli) -> Result<(Option<()>, Option<usize>), String> {
+    Ok((None, None))
 }
 
 /// Where the base scan public key `D` of split-key mode comes from.
@@ -153,6 +265,37 @@ enum Command {
     Recover(RecoverArgs),
     /// Apply a tweak to the BIP32-derived scan secret key
     Apply(ApplyArgs),
+    /// Time GPU configurations on this machine and write the fastest to a file for
+    /// `--gpu-params`
+    #[cfg(feature = "cuda")]
+    BenchGpu(BenchArgs),
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Args)]
+struct BenchArgs {
+    /// the pattern(s) of the planned search: the key count sets the per-point test cost
+    #[arg(value_name = "PATTERN", default_value = "sp1qqgmlnmarkets")]
+    patterns: Vec<String>,
+
+    #[arg(short, long, value_enum, default_value_t = Network::Mainnet)]
+    network: Network,
+
+    /// where to write the tuned parameters
+    #[arg(short, long, value_name = "PATH", default_value = "gpu-params.txt")]
+    output: PathBuf,
+
+    /// CUDA devices to use, e.g. 0,1,3 [default: all]; the sweep runs on the first
+    #[arg(long, value_name = "LIST")]
+    gpu_devices: Option<String>,
+
+    /// seconds timed per configuration (after a warm-up)
+    #[arg(long, value_name = "S", default_value_t = 4.0)]
+    seconds: f64,
+
+    /// a shorter sweep (about a third of the configurations)
+    #[arg(long)]
+    quick: bool,
 }
 
 #[derive(Args)]
@@ -206,6 +349,8 @@ fn main() -> ExitCode {
     let outcome = match cli.command {
         Some(Command::Recover(args)) => run_recover(&args),
         Some(Command::Apply(args)) => run_apply(&args),
+        #[cfg(feature = "cuda")]
+        Some(Command::BenchGpu(args)) => run_bench_gpu(&args),
         None => Search::from_args(cli).and_then(|search| search.run()),
     };
     match outcome {
@@ -225,9 +370,14 @@ struct Search {
     table: Table,
     /// CPU worker threads (0 when only the GPU searches).
     threads: usize,
-    /// Split mode: first range to sweep (`--from-range`, `--resume`).
+    /// Split mode: first range to sweep (`--from-range`, `--resume`, or the
+    /// checkpoint's done prefix).
     from_range: usize,
-    #[cfg(feature = "gpu")]
+    /// Split mode: swept ranges above `from_range` (from the checkpoint).
+    done_above: Vec<usize>,
+    /// `--checkpoint`: the file and what it holds.
+    checkpoint: Option<(PathBuf, checkpoint::Checkpoint)>,
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     gpu: Option<gpu::Config>,
     count: u64,
     spend: [u8; 33],
@@ -244,14 +394,16 @@ impl Search {
             Some(text) => parse_pubkey(text, "--spend-pubkey")?,
             None => ProjectivePoint::GENERATOR * search::random_scalar()?,
         };
-        let gpu = gpu_config(&cli)?;
-        // With the GPU, CPU workers still help (about +25% on an M3 Pro) but
-        // the GPU driver and the collector need a core each: default to two
-        // fewer than the machine has, and let `-c 0` mean none.
-        let cores = match (gpu.is_some(), cli.cores) {
-            (true, None) => thread_count(None)?.saturating_sub(2),
-            (true, Some(0)) => 0,
-            (_, cores) => thread_count(cores)?,
+        let (gpu, cores_hint) = gpu_config(&cli)?;
+        // With the Metal GPU, CPU workers still help (about +25% on an M3
+        // Pro) but the GPU driver and the collector need a core each: default
+        // to two fewer than the machine has, and let `-c 0` mean none. CUDA
+        // suggests its own default (`gpu_config`).
+        let cores = match (gpu.is_some(), cli.cores, cores_hint) {
+            (true, None, Some(hint)) => hint,
+            (true, None, None) => thread_count(None)?.saturating_sub(2),
+            (true, Some(0), _) => 0,
+            (_, cores, _) => thread_count(cores)?,
         };
         check_batch(cli.batch)?;
         if cli.count == 0 {
@@ -273,8 +425,12 @@ impl Search {
                     .to_string(),
             );
         }
-        let workers = threads + usize::from(gpu.is_some());
-        let from_range = match (cli.from_range, &cli.resume) {
+        let engines = gpu_engines(gpu.as_ref());
+        if threads + engines == 0 {
+            return Err("no worker: -c 0 without a GPU".to_string());
+        }
+        let workers = threads + engines;
+        let mut from_range = match (cli.from_range, &cli.resume) {
             (None, None) => 0,
             (Some(_), _) | (_, Some(_)) if matches!(mode, Mode::Random) => {
                 return Err(
@@ -296,8 +452,58 @@ impl Search {
                 // while a GPU sweeps ranges at 86 s each.
                 let tested = parse_count(text)?;
                 let ranges = (tested / search::split_range_candidates()) as usize;
-                let skew = if gpu.is_some() { 64 } else { 0 };
+                let skew = 64 * engines;
                 ranges.saturating_sub(workers + skew)
+            }
+        };
+        let mut done_above = Vec::new();
+        let checkpoint = match (&cli.checkpoint, &mode) {
+            (None, _) => None,
+            (Some(_), Mode::Random) => {
+                return Err(
+                    "--checkpoint only applies to split-key mode (-b or --xpub): a random-mode \
+                     search keeps no state worth resuming"
+                        .to_string(),
+                );
+            }
+            (Some(path), Mode::Split { base }) => {
+                let mut texts: Vec<String> =
+                    patterns.patterns.iter().map(|p| p.text.clone()).collect();
+                texts.sort();
+                let identity = checkpoint::Identity {
+                    base: compressed(base),
+                    hrp: network.hrp().to_string(),
+                    patterns: texts,
+                };
+                let saved = match checkpoint::Checkpoint::load(path)? {
+                    Some(saved) => {
+                        if let Some(why) = checkpoint::mismatch(&saved.identity, &identity) {
+                            return Err(format!(
+                                "--checkpoint {}: {why}; use another file for this search",
+                                path.display()
+                            ));
+                        }
+                        if cli.from_range.is_some() || cli.resume.is_some() {
+                            return Err(format!(
+                                "--checkpoint {} already says where to resume; drop \
+                                 --from-range / --resume",
+                                path.display()
+                            ));
+                        }
+                        from_range = saved.prefix;
+                        done_above = saved.done.clone();
+                        saved
+                    }
+                    None => {
+                        let mut fresh = checkpoint::Checkpoint::new(identity);
+                        fresh.prefix = from_range;
+                        fresh.tested = from_range as u64 * search::split_range_candidates();
+                        // Written now so that a bad path fails before the search.
+                        fresh.save(path)?;
+                        fresh
+                    }
+                };
+                Some((path.clone(), saved))
             }
         };
         Ok(Search {
@@ -307,7 +513,9 @@ impl Search {
             table: Table::new(cli.batch, ProjectivePoint::GENERATOR),
             threads,
             from_range,
-            #[cfg(feature = "gpu")]
+            done_above,
+            checkpoint,
+            #[cfg(any(feature = "gpu", feature = "cuda"))]
             gpu,
             count: cli.count,
             spend: compressed(&spend),
@@ -321,19 +529,19 @@ impl Search {
         self.patterns.expected_candidates()
     }
 
-    #[cfg(feature = "gpu")]
+    #[cfg(any(feature = "gpu", feature = "cuda"))]
     fn gpu(&self) -> Option<&gpu::Config> {
         self.gpu.as_ref()
     }
 
-    #[cfg(not(feature = "gpu"))]
+    #[cfg(not(any(feature = "gpu", feature = "cuda")))]
     fn gpu(&self) -> Option<&()> {
         None
     }
 
-    /// Workers in total: CPU threads plus the GPU driver.
+    /// Workers in total: CPU threads plus one GPU driver per device.
     fn workers(&self) -> usize {
-        self.threads + usize::from(self.gpu().is_some())
+        self.threads + gpu_engines(self.gpu())
     }
 
     /// Start-up banner part describing the GPU, when used.
@@ -347,13 +555,24 @@ impl Search {
                 2 * cfg.half
             );
         }
+        #[cfg(feature = "cuda")]
+        if let Some(cfg) = self.gpu() {
+            let name = gpu::device_name(cfg).unwrap_or_else(|e| e);
+            return format!(
+                " | GPU {name}: {} walks per device, batch {}, block {}×{}",
+                cfg.threads,
+                2 * cfg.half,
+                cfg.block,
+                cfg.min_blocks
+            );
+        }
         String::new()
     }
 
     /// x candidates a full split-mode search can visit, over every engine.
     fn split_coverage(&self) -> f64 {
         let cpu = search::split_coverage(self.table.half);
-        #[cfg(feature = "gpu")]
+        #[cfg(any(feature = "gpu", feature = "cuda"))]
         if let Some(cfg) = self.gpu() {
             let gpu = gpu::split_coverage(cfg);
             return if self.threads > 0 { cpu.min(gpu) } else { gpu };
@@ -387,11 +606,20 @@ impl Search {
                 String::new()
             }
         );
-        if self.from_range > 0 {
+        let resumed = self.from_range + self.done_above.len();
+        if resumed > 0 {
             eprintln!(
-                "resuming from range {} of {SPLIT_RANGES} (≈ {} candidates already tested)",
+                "resuming: {resumed} of {SPLIT_RANGES} ranges already swept, from range {} on \
+                 (≈ {} candidates already tested)",
                 self.from_range,
-                human_count((self.from_range as u64 * search::split_range_candidates()) as f64)
+                human_count((resumed as u64 * search::split_range_candidates()) as f64)
+            );
+        }
+        if let Some((path, _)) = &self.checkpoint {
+            eprintln!(
+                "checkpoint: {} (every {} s and on exit)",
+                path.display(),
+                CHECKPOINT_EVERY.as_secs()
             );
         }
         // Split-key mode covers every offset below 2^MAX_TWEAK_BITS whatever the thread
@@ -414,12 +642,47 @@ impl Search {
             Some(path) => Some((path.as_path(), create_secret_file(path)?)),
             None => None,
         };
+        let mut writer = self.checkpoint.as_ref().map(|(path, cp)| CheckpointWriter {
+            path: path.clone(),
+            cp: cp.clone(),
+            saved: Instant::now(),
+            failing: false,
+        });
+        // Matches an earlier run found (and recorded) count towards -k.
+        let earlier = writer.as_ref().map_or(0, |w| w.cp.found.len() as u64);
+        if let (Some(w), Mode::Split { base }) = (&writer, &self.mode) {
+            for tweak in &w.cp.found {
+                self.print_earlier_match(base, tweak);
+            }
+            if earlier >= self.count {
+                eprintln!(
+                    "checkpoint {}: {earlier} match(es) already found, nothing left to search \
+                     (raise -k to look for more)",
+                    w.path.display()
+                );
+                return Ok(());
+            }
+        }
         if !self.quiet {
             self.announce();
         }
+        // With a checkpoint, a termination signal stops the search cleanly and
+        // saves the swept ranges; a second SIGINT kills at once.
+        let interrupted = Arc::new(AtomicBool::new(false));
+        if writer.is_some() {
+            use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+            let register = || -> io::Result<()> {
+                signal_hook::flag::register_conditional_shutdown(SIGINT, 130, interrupted.clone())?;
+                for signal in [SIGINT, SIGTERM, SIGHUP] {
+                    signal_hook::flag::register(signal, interrupted.clone())?;
+                }
+                Ok(())
+            };
+            register().map_err(|e| format!("installing the signal handlers: {e}"))?;
+        }
         let shared = match self.mode {
             Mode::Random => Shared::new(self.workers()),
-            Mode::Split { .. } => Shared::split(self.workers(), self.from_range),
+            Mode::Split { .. } => Shared::resume(self.workers(), self.from_range, &self.done_above),
         };
         let (sender, receiver) = mpsc::channel();
         let started = Instant::now();
@@ -441,36 +704,98 @@ impl Search {
                     break;
                 }
             }
-            #[cfg(feature = "gpu")]
+            #[cfg(any(feature = "gpu", feature = "cuda"))]
             if let Some(cfg) = self.gpu() {
-                let sender = sender.clone();
-                let (patterns, mode, shared, index) =
-                    (&self.patterns, &self.mode, &shared, self.threads);
-                scope.spawn(move || gpu::worker(index, cfg, patterns, mode, shared, &sender));
+                for slot in 0..gpu::engines(cfg) {
+                    let sender = sender.clone();
+                    let (patterns, mode, shared, index) =
+                        (&self.patterns, &self.mode, &shared, self.threads + slot);
+                    scope.spawn(move || {
+                        gpu::worker(index, slot, cfg, patterns, mode, shared, &sender)
+                    });
+                }
             }
             drop(sender);
             if result.is_ok() {
-                result = self.collect(&receiver, &shared, started, &mut output);
+                let mut run = Collect {
+                    shared: &shared,
+                    started,
+                    output: &mut output,
+                    writer: writer.as_mut(),
+                    interrupted: &interrupted,
+                    wanted: self.count - earlier,
+                };
+                result = self.collect(&receiver, &mut run);
             }
             shared.stop.store(true, Ordering::Relaxed);
         });
+        // Every worker has stopped: the last ranges they completed are in.
+        if let Some(w) = writer.as_mut() {
+            w.record(&shared);
+            if let Err(e) = w.cp.save(&w.path) {
+                eprintln!("warning: {e}");
+            } else if interrupted.load(Ordering::Relaxed) {
+                eprintln!(
+                    "checkpoint saved: {} of {SPLIT_RANGES} ranges swept; rerun the same command \
+                     to continue",
+                    w.cp.ranges_done()
+                );
+            }
+        }
         result
     }
 
-    /// Receives, verifies and prints matches; shows progress once a second.
+    /// A match recorded in the checkpoint by an earlier run, re-derived from
+    /// its tweak.
+    fn print_earlier_match(&self, base: &ProjectivePoint, tweak: &Tweak) {
+        let pubkey = compressed(&tweak.apply_point(base));
+        let addr = address::encode(self.network.hrp(), &pubkey, &self.spend);
+        let mut out = io::stdout().lock();
+        let _ = writeln!(out, "found by an earlier run (checkpoint):");
+        let _ = writeln!(out, "base scan pubkey  : {}", hex::encode(compressed(base)));
+        let _ = writeln!(out, "tweak             : {tweak}");
+        let _ = writeln!(out, "vanity scan pubkey: {}", hex::encode(pubkey));
+        let _ = writeln!(out, "address           : {addr}");
+        let _ = writeln!(
+            out,
+            "scan_priv = {}   → run: spaghetti apply --scan-priv-file <d hex file> --tweak {tweak}",
+            tweak.formula()
+        );
+        let _ = writeln!(out);
+        let _ = out.flush();
+    }
+
+    /// Receives, verifies and prints matches; shows progress once a second
+    /// and keeps the checkpoint up to date.
     fn collect(
         &self,
         receiver: &mpsc::Receiver<Result<Found, String>>,
-        shared: &Shared,
-        started: Instant,
-        output: &mut Option<(&Path, File)>,
+        run: &mut Collect,
     ) -> Result<(), String> {
+        let (shared, started) = (run.shared, run.started);
+        let output = &mut *run.output;
         let mut status = StatusLine::default();
         let mut last_progress = Instant::now();
         let mut found_count = 0;
         let result = loop {
+            if run.interrupted.load(Ordering::Relaxed) {
+                break Err("interrupted by a signal".to_string());
+            }
+            if let Some(w) = run.writer.as_mut()
+                && w.saved.elapsed() >= CHECKPOINT_EVERY
+            {
+                w.record(shared);
+                w.save_or_warn(&mut status);
+            }
             match receiver.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(found)) => {
+                    // A resumed search redoes the ranges that were in flight
+                    // and may meet a match it already recorded.
+                    if let (Some(w), Key::Tweak { tweak, .. }) = (run.writer.as_ref(), &found.key)
+                        && w.cp.found.contains(tweak)
+                    {
+                        continue;
+                    }
                     let elapsed = started.elapsed();
                     let tested = shared.tested();
                     let tested_here = shared.tested_here();
@@ -501,8 +826,13 @@ impl Search {
                             let _ = matched.write(&mut out, SecretLine::Show);
                         }
                     }
+                    if let (Some(w), Key::Tweak { tweak, .. }) = (run.writer.as_mut(), &found.key) {
+                        w.cp.found.push(*tweak);
+                        w.record(shared);
+                        w.save_or_warn(&mut status);
+                    }
                     found_count += 1;
-                    if found_count >= self.count {
+                    if found_count >= run.wanted {
                         break Ok(());
                     }
                 }
@@ -575,6 +905,64 @@ fn final_check(addr: &str, found: &Found, patterns: &PatternSet) -> Result<(), S
         ));
     }
     Ok(())
+}
+
+/// GPU host workers of a configuration (one per device).
+#[cfg(any(feature = "gpu", feature = "cuda"))]
+fn gpu_engines(cfg: Option<&gpu::Config>) -> usize {
+    cfg.map_or(0, gpu::engines)
+}
+
+#[cfg(not(any(feature = "gpu", feature = "cuda")))]
+fn gpu_engines(_cfg: Option<&()>) -> usize {
+    0
+}
+
+/// The state `Search::collect` works on.
+struct Collect<'a, 'o> {
+    shared: &'a Shared,
+    started: Instant,
+    output: &'a mut Option<(&'o Path, File)>,
+    writer: Option<&'a mut CheckpointWriter>,
+    interrupted: &'a AtomicBool,
+    /// Matches still to find in this run (`-k` minus the checkpoint's).
+    wanted: u64,
+}
+
+/// `--checkpoint`: the file, its content, and when it was last written.
+struct CheckpointWriter {
+    path: PathBuf,
+    cp: checkpoint::Checkpoint,
+    saved: Instant,
+    /// The last save failed (warned once until one succeeds).
+    failing: bool,
+}
+
+impl CheckpointWriter {
+    /// Copies the swept ranges and the tested count from the workers.
+    fn record(&mut self, shared: &Shared) {
+        self.cp.prefix = shared.done_prefix();
+        self.cp.done = shared.done_above_prefix();
+        self.cp.tested = shared.tested();
+    }
+
+    /// Saves; a failure is reported (once) and retried at the next interval
+    /// rather than stopping the search.
+    fn save_or_warn(&mut self, status: &mut StatusLine) {
+        self.saved = Instant::now();
+        match self.cp.save(&self.path) {
+            Ok(()) => self.failing = false,
+            Err(e) if !self.failing => {
+                self.failing = true;
+                status.clear();
+                eprintln!(
+                    "warning: checkpoint not saved, retrying every {} s: {e}",
+                    CHECKPOINT_EVERY.as_secs()
+                );
+            }
+            Err(_) => {}
+        }
+    }
 }
 
 /// Where the secret line of a match goes.
@@ -761,6 +1149,76 @@ fn run_recover(args: &RecoverArgs) -> Result<(), String> {
     Ok(())
 }
 
+/// `bench-gpu`: tunes the CUDA engine on this machine and writes the
+/// parameters for `--gpu-params`.
+#[cfg(feature = "cuda")]
+fn run_bench_gpu(args: &BenchArgs) -> Result<(), String> {
+    let patterns = PatternSet::parse(&args.patterns, args.network)?;
+    let devices = match &args.gpu_devices {
+        Some(list) => gpu::parse_devices(list)?,
+        None => gpu::all_devices()?,
+    };
+    if !(args.seconds.is_finite() && (0.5..=600.0).contains(&args.seconds)) {
+        return Err("--seconds: between 0.5 and 600".to_string());
+    }
+    let names: Vec<&str> = patterns.patterns.iter().map(|p| p.text.as_str()).collect();
+    eprintln!(
+        "bench-gpu: {} on device(s) {:?}, {} s per configuration{}",
+        names.join(" | "),
+        devices,
+        args.seconds,
+        if args.quick { ", quick sweep" } else { "" }
+    );
+    let started = Instant::now();
+    let report = gpu::autotune(
+        &devices,
+        &patterns,
+        Duration::from_secs_f64(args.seconds),
+        args.quick,
+        &mut |line| eprintln!("{line}"),
+    )?;
+    let tuning = &report.tuning;
+    let rate = tuning.rate.unwrap_or(report.gpus_alone);
+    let expected = patterns.expected_candidates();
+    let device = tuning.device.clone().unwrap_or_default();
+    let comments = vec![
+        format!(
+            "spaghetti bench-gpu: {} × {device}, pattern {}",
+            devices.len(),
+            names.join(" ")
+        ),
+        format!(
+            "measured {}/s per device, {}/s in total ({} configurations, {})",
+            human_count(report.per_device),
+            human_count(rate),
+            report.samples.len(),
+            human_duration(started.elapsed().as_secs_f64())
+        ),
+        format!(
+            "expected search time at that rate: {} (difficulty ≈ {} candidates)",
+            human_duration(expected / rate),
+            human_count(expected)
+        ),
+        format!(
+            "use: spaghetti --gpu-params {} --checkpoint search.checkpoint -b <HEX33> {}",
+            args.output.display(),
+            names.join(" ")
+        ),
+        format!("same as: {}", tuning.flags()),
+        "cores: CPU threads next to the GPUs, only when they measured > 5% faster; a CPU \
+         thread needs hours per range and redoes it after an interruption"
+            .to_string(),
+    ];
+    std::fs::write(&args.output, tuning.to_text(&comments))
+        .map_err(|e| format!("--output {}: {e}", args.output.display()))?;
+    let mut out = io::stdout().lock();
+    for line in &comments {
+        let _ = writeln!(out, "{line}");
+    }
+    let _ = writeln!(out, "written to {}", args.output.display());
+    Ok(())
+}
+
 fn run_apply(args: &ApplyArgs) -> Result<(), String> {
     let d = read_secret_file(&args.scan_priv_file)?;
     let secret = Zeroizing::new(args.tweak.apply(&d));
@@ -912,14 +1370,28 @@ fn check_batch(half: usize) -> Result<(), String> {
 
 // ---- progress and formatting ------------------------------------------------
 
-/// One stderr line that is overwritten in place.
+/// One stderr line that is overwritten in place. When stderr is not a
+/// terminal (a log file, journald), a plain line once a minute instead.
 #[derive(Default)]
 struct StatusLine {
     shown: bool,
+    /// Not a terminal: when the last plain line was written.
+    logged: Option<Instant>,
 }
+
+/// Interval of the progress lines written to a non-terminal stderr.
+const LOG_EVERY: Duration = Duration::from_secs(60);
 
 impl StatusLine {
     fn show(&mut self, text: &str) {
+        use std::io::IsTerminal;
+        if !std::io::stderr().is_terminal() {
+            if self.logged.is_none_or(|at| at.elapsed() >= LOG_EVERY) {
+                eprintln!("{text}");
+                self.logged = Some(Instant::now());
+            }
+            return;
+        }
         eprint!("\r\x1b[K{text}");
         let _ = std::io::stderr().flush();
         self.shown = true;

@@ -122,6 +122,11 @@ pub fn split_coverage(cfg: &Config) -> f64 {
     3.0 * per_walk * cfg.threads as f64 * SPLIT_RANGES as f64
 }
 
+/// Number of host workers the configuration runs: the one Metal device.
+pub fn engines(_cfg: &Config) -> usize {
+    1
+}
+
 /// Name of the default Metal device, for the start-up banner.
 pub fn device_name() -> Result<String, String> {
     MTLCreateSystemDefaultDevice()
@@ -481,8 +486,10 @@ fn centres_of(k0: &[Scalar], base: &ProjectivePoint) -> Vec<Option<(Fe, Fe)>> {
 /// The GPU worker: the counterpart of `search::worker` for the GPU engine.
 /// Every hit (or error) goes to `sender`; it returns when `shared.stop` is
 /// set, the receiver is gone or (split mode) every range has been taken.
+/// `_slot` is the device slot (see `engines`; always 0 here).
 pub fn worker(
     index: usize,
+    _slot: usize,
     cfg: &Config,
     patterns: &PatternSet,
     mode: &Mode,
@@ -892,7 +899,7 @@ mod tests {
         let shared = Shared::new(1);
         let (sender, receiver) = mpsc::channel();
         thread::scope(|scope| {
-            scope.spawn(|| worker(0, &cfg, &patterns, &Mode::Random, &shared, &sender));
+            scope.spawn(|| worker(0, 0, &cfg, &patterns, &Mode::Random, &shared, &sender));
             for _ in 0..3 {
                 let found = receiver.recv().unwrap().expect("no error");
                 assert_eq!(found.pubkey[0], 0x02, "sp1qqg fixes an even y");
@@ -922,7 +929,7 @@ mod tests {
         let shared = Shared::new(1);
         let (sender, receiver) = mpsc::channel();
         thread::scope(|scope| {
-            scope.spawn(|| worker(0, &cfg, &patterns, &mode, &shared, &sender));
+            scope.spawn(|| worker(0, 0, &cfg, &patterns, &mode, &shared, &sender));
             for _ in 0..5 {
                 let found = receiver.recv().unwrap().expect("no error");
                 let search::Key::Tweak { base: b, tweak } = found.key else {

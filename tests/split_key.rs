@@ -431,3 +431,117 @@ fn output_file_holds_the_secret() {
     );
     assert!(!split_file.0.exists());
 }
+
+/// `--checkpoint`: matches are recorded and count towards `-k` on a rerun
+/// (and are not reported twice when the redone ranges meet them again), a
+/// checkpoint of another search is refused, and random mode rejects it.
+#[test]
+fn checkpoint_records_matches_and_guards_its_search() {
+    let base = "0201e79b7d70f29abcc2c41665ac88131fe0ea7be269e558f1aac4ab78522bf51f";
+    let path = TempPath::new("search.checkpoint");
+    let run = |k: &str, pattern: &str| {
+        spaghetti(&[
+            "-q",
+            "-c",
+            "2",
+            "-k",
+            k,
+            "-b",
+            base,
+            "--checkpoint",
+            path.as_str(),
+            pattern,
+        ])
+    };
+    let (ok, out, err) = run("1", "sp1qq?pa");
+    assert!(ok, "{err}");
+    let first = fields(&out)["tweak"].clone();
+    let text = std::fs::read_to_string(&path.0).expect("checkpoint written");
+    assert!(text.contains(&format!("found {first}\n")), "{text}");
+    assert!(text.contains("pattern sp1qq?pa\n"), "{text}");
+
+    // Already satisfied: prints the recorded match, searches nothing.
+    let (ok, out, err) = run("1", "sp1qq?pa");
+    assert!(ok, "{err}");
+    assert!(
+        out.contains("found by an earlier run") && out.contains(&first),
+        "{out}"
+    );
+    assert!(err.contains("nothing left to search"), "{err}");
+
+    // One more: a new tweak, and the recorded one is not reported again.
+    let (ok, out, err) = run("2", "sp1qq?pa");
+    assert!(ok, "{err}");
+    let tweaks: Vec<&str> = out
+        .lines()
+        .filter_map(|l| l.strip_prefix("tweak             : "))
+        .collect();
+    assert_eq!(tweaks.len(), 2, "{out}");
+    assert_eq!(tweaks[0], first);
+    assert_ne!(tweaks[1], first);
+    let text = std::fs::read_to_string(&path.0).unwrap();
+    assert_eq!(text.matches("\nfound ").count(), 2, "{text}");
+
+    // Another pattern, another base key, --from-range: refused.
+    let (ok, _, err) = run("1", "sp1qq?pe");
+    assert!(!ok && err.contains("swept for the pattern"), "{err}");
+    let other = "03edb2b32ed41a5ece06a36f32e1c8992aff392ea6c6703bc41f1986a53ccf79cb";
+    let (ok, _, err) = spaghetti(&["-q", "-b", other, "--checkpoint", path.as_str(), "sp1qq?pa"]);
+    assert!(!ok && err.contains("base key"), "{err}");
+    let (ok, _, err) = spaghetti(&[
+        "-q",
+        "-b",
+        base,
+        "--checkpoint",
+        path.as_str(),
+        "--from-range",
+        "3",
+        "sp1qq?pa",
+    ]);
+    assert!(!ok && err.contains("already says where to resume"), "{err}");
+    let (ok, _, err) = spaghetti(&["-q", "--checkpoint", path.as_str(), "sp1qq?pa"]);
+    assert!(
+        !ok && err.contains("only applies to split-key mode"),
+        "{err}"
+    );
+}
+
+/// A fresh checkpoint started with `--from-range` records that start, and a
+/// resumed run announces it.
+#[cfg(unix)]
+#[test]
+fn checkpoint_resumes_from_its_prefix() {
+    let base = "0201e79b7d70f29abcc2c41665ac88131fe0ea7be269e558f1aac4ab78522bf51f";
+    let path = TempPath::new("resume.checkpoint");
+    let (ok, out, err) = spaghetti(&[
+        "-c",
+        "2",
+        "-b",
+        base,
+        "--checkpoint",
+        path.as_str(),
+        "--from-range",
+        "5",
+        "sp1qq?pa",
+    ]);
+    assert!(ok, "{err}");
+    let tweak = fields(&out)["tweak"].clone();
+    let t: u64 = tweak.split('/').next().unwrap().parse().unwrap();
+    assert!(t >> 36 >= 5, "{tweak}");
+    let text = std::fs::read_to_string(&path.0).unwrap();
+    assert!(text.contains("\nprefix 5\n"), "{text}");
+    // Rerun with -k 2: resumes at range 5.
+    let (ok, _, err) = spaghetti(&[
+        "-c",
+        "2",
+        "-k",
+        "2",
+        "-b",
+        base,
+        "--checkpoint",
+        path.as_str(),
+        "sp1qq?pa",
+    ]);
+    assert!(ok, "{err}");
+    assert!(err.contains("resuming: 5 of"), "{err}");
+}

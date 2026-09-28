@@ -81,13 +81,13 @@ impl Fe {
     }
 
     /// The four little-endian 64-bit limbs.
-    #[cfg(any(feature = "gpu", test))]
+    #[cfg(any(feature = "gpu", feature = "cuda", test))]
     pub fn limbs(&self) -> [u64; 4] {
         self.0
     }
 
     /// From little-endian limbs; `None` unless the value is canonical (`< p`).
-    #[cfg(any(feature = "gpu", test))]
+    #[cfg(any(feature = "gpu", feature = "cuda", test))]
     pub fn from_limbs(limbs: [u64; 4]) -> Option<Fe> {
         let (_, carry) = add_c(&limbs);
         (!carry).then_some(Fe(limbs))

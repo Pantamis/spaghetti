@@ -28,6 +28,11 @@ objc2 = { version = "0.6.4", optional = true }
 objc2-foundation = { version = "0.3.2", optional = true, default-features = false, features = ["std", "NSString", "NSError", "NSObject"] }
 objc2-metal = { version = "0.3.2", optional = true, default-features = false, features = ["std", "MTLDevice", "MTLLibrary", "MTLBuffer", "MTLResource", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLTypes", "MTLAllocation"] }
 
+# CUDA: driver API and NVRTC, both loaded at run time (dlopen); the build only
+# needs `nvcc --version` to pick the binding version (or CUDARC_CUDA_VERSION).
+cudarc = { version = "0.19.10", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "dynamic-loading", "cuda-version-from-build-system", "fallback-latest"] }
+signal-hook = "0.3"
+
 [features]
 # AArch64 inline assembly for the field arithmetic (src/field/aarch64.rs); the
 # only `unsafe`. Measured level with the portable code on Apple M3.
@@ -36,6 +41,11 @@ asm = []
 # through the objc2-metal bindings; the shader is compiled at run time by the
 # Metal framework (no Xcode needed).
 gpu = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal"]
+# NVIDIA CUDA GPU search (src/cuda.rs, src/cuda/search.cu): `--gpu` on one or
+# more devices, and `bench-gpu`. The kernel is compiled at run time by NVRTC
+# for the GPU found; the CUDA driver and NVRTC libraries are loaded at run
+# time. Exclusive with `gpu`.
+cuda = ["dep:cudarc"]
 
 [dev-dependencies]
 num-bigint = "0.5.1"

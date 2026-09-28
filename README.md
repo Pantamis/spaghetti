@@ -14,6 +14,8 @@ or clone and `cargo build --release` (binary in `target/release/spaghetti`). `RU
 
 On Apple silicon, `cargo build --release --features gpu` adds the Metal GPU search (`--gpu`, see [Difficulty](#difficulty)) through the `objc2-metal` bindings; it needs macOS but no Xcode, the shader is compiled by the Metal framework when the program starts.
 
+On Linux with NVIDIA GPUs, `cargo build --release --features cuda` adds the CUDA search instead (`--gpu` on every GPU of the machine, `bench-gpu` to tune it; see [CUDA GPUs and spot instances](#cuda-gpus-and-spot-instances)). The CUDA driver (`libcuda`) and NVRTC (`libnvrtc`, CUDA toolkit 11.4 or later) are loaded when the program starts, and the kernel is compiled then for the GPU found; the build only runs `nvcc --version` to pick the CUDA API version (without `nvcc`, set it, e.g. `CUDARC_CUDA_VERSION=12040` for 12.4). The two GPU features are exclusive.
+
 ## Usage
 
 ```
@@ -29,6 +31,9 @@ spaghetti --output key.txt pasta    # secret goes to a new 0600 file, not to the
 spaghetti --gpu farfalle            # GPU + CPU threads (build with --features gpu; -c 0 for the GPU alone)
 spaghetti -b 02… --from-range 1234 pasta   # continue an interrupted split-key search (value shown in its progress line)
 spaghetti -b 02… --resume 126.89T pasta    # same, from the `tested` count it displayed (approximate)
+spaghetti -b 02… --checkpoint run.ckpt pasta   # split-key: keep the swept ranges in a file, rerun to continue
+spaghetti bench-gpu sp1qqgmlnmarkets       # CUDA: time GPU configurations here, write gpu-params.txt
+spaghetti --gpu-params gpu-params.txt --checkpoint run.ckpt -b 02… sp1qqgmlnmarkets   # CUDA, all GPUs
 spaghetti recover --address sp1qq… -b 02…   # find the tweak of a published address
 spaghetti apply --scan-priv-file d.hex --tweak 48213946821/1/-   # wallet scan key (- = stdin)
 ```
@@ -52,7 +57,22 @@ spaghetti [OPTIONS] <PATTERN>...
       --from-range <N>         split-key mode: skip the first N ranges of 2^36 offsets (the progress
                                line of a previous run shows the value to pass)
       --resume <COUNT>         split-key mode: resume near a previous run's `tested` count, e.g. 126.89T
+      --checkpoint <PATH>      split-key mode: record the swept ranges and the matches in this file
+                               (rewritten atomically every 10 s, on exit and on SIGTERM/SIGINT/SIGHUP)
+                               and, if it exists, continue from it
   -q, --quiet                  no progress output
+
+CUDA builds (--features cuda) instead of --gpu (Metal):
+      --gpu                    search on the NVIDIA GPUs, alone unless -c N adds CPU threads
+      --gpu-params <PATH>      parameters written by `spaghetti bench-gpu` (implies --gpu; explicit
+                               --gpu-* flags and -c win over the file)
+      --gpu-devices <LIST>     CUDA devices, e.g. 0,1,3 [default: all]
+      --gpu-threads <N>        walks per device, a multiple of 32 [default: 65536]
+      --gpu-batch <N>          half-batch H, 2H points per inversion per walk [default: 1024]
+      --gpu-block <N>          CUDA threads per block [default: 128]
+      --gpu-min-blocks <N>     minimum resident blocks per SM (caps the registers) [default: 1]
+
+spaghetti bench-gpu [PATTERN]... [--output gpu-params.txt] [--gpu-devices LIST] [--seconds 4] [--quick]
 
 spaghetti recover --address <SP_ADDRESS> (-b <HEX33> | --xpub <XPUB>) [-c N] [--baby-bits K]
 spaghetti apply --scan-priv-file <PATH> --tweak <t/e/s> [--address <SP_ADDRESS>] [--output <PATH>]
@@ -95,6 +115,8 @@ scan_priv = λ^1·(d + 87960930315849) mod n   → run: spaghetti apply --scan-p
 ```
 
 **Interrupting and resuming.** Unlike random mode, a split-key search is deterministic: it sweeps the ranges in order, so a restarted search would redo what it already did. The progress line therefore ends with `--from-range N`, the first range not yet fully swept (every range below it is done, whichever worker did it); pass that to the next run and it continues from there, crediting the skipped ranges to the `tested` count so the ETA carries on. Ranges in flight when the run stopped are redone: up to one per worker, about 86 s of GPU work or an hour of a CPU thread each. If you only kept the `tested` count, `--resume 126.89T` converts it: it backs off by the ranges the workers could have held (one each, plus what a CPU thread may still hold while the GPU sweeps 86 s ranges), so it redoes an hour or two of GPU work and skips nothing, assuming the previous run used the same version and configuration.
+
+**Checkpoint file.** For long or unattended searches, `--checkpoint <path>` does this bookkeeping itself. The file records the done prefix *and* every range swept above it (workers finish ranges out of order), the matches found so far, and the search it belongs to (base key, hrp, patterns); it is rewritten atomically (temporary file, fsync, rename) every 10 s, on exit, and when a SIGTERM, SIGINT or SIGHUP stops the search cleanly (a second Ctrl-C kills at once). Rerunning the same command continues exactly where the file says: swept ranges are skipped and credited to the `tested` count, only the ranges that were in flight are redone (on a GPU, tens of seconds each), and matches already recorded count towards `-k` (with `-k 1` and a recorded match, the rerun prints it and exits). A checkpoint written for another base key, network or pattern is refused, since its ranges were swept for its own patterns only. The file holds no secret. The GPU parameters and the thread count may change between runs: a range is swept completely whatever engine sweeps it.
 
 **What to store.** The tweak string, next to the descriptor. It is public data (it reveals nothing about `d`), plaintext is fine, and it is not even required: only the seed is secret, and the tweak can be recomputed. It is not neutral, though: the tweak together with any address of the wallet reveals the standard scan pubkey `D` (`D = s·λ^{-e}·B − t·G`), so publishing the tweak links the vanity wallet to the wallet's standard BIP352 address if that address was ever used.
 
@@ -163,6 +185,63 @@ The search is memoryless: the ETA in the progress line is `(expected − tested)
 
 The default (`--gpu` with no `-c`) is therefore the GPU plus two fewer CPU threads than the machine has, leaving a core to the GPU driver and one to the collector. The GPU configuration (hidden `--gpu-threads` and `--gpu-batch`) uses about 1.1 GB of GPU memory for the prefix products; `--gpu-batch 512` halves it for 2–3% of the rate, `--gpu-threads 16384` halves it again for another 5%.
 
+## CUDA GPUs and spot instances
+
+Build with `cargo build --release --features cuda` on a machine with the NVIDIA driver and the CUDA toolkit (for `libnvrtc`). `--gpu` then runs one walk engine per GPU (all of them unless `--gpu-devices` says otherwise), each taking split-key ranges from the shared queue; CPU threads are off by default with CUDA (`-c N` adds them): next to a data-centre GPU they add little, and a CPU thread needs hours to finish a 2^36-offset range, which it redoes after an interruption.
+
+**Tuning.** The best walk count, half-batch `H` and block shape depend on the GPU model, so measure them on the machine that will do the search:
+
+```
+spaghetti bench-gpu sp1qqgmlnmarkets          # ~10–20 min; --quick for ~5; writes gpu-params.txt
+spaghetti --gpu-params gpu-params.txt --checkpoint run.ckpt -b 02… sp1qqgmlnmarkets
+```
+
+`bench-gpu` runs the real split-key engine (random base key, the planned pattern, since the key count sets the per-point cost) on the first device for a few seconds per configuration: the block shape (threads per block × minimum blocks per SM, which caps the registers per thread), then the walk count, then `H`, then the walk count again, then the winner on every device together and with CPU threads. It writes the fastest parameters, the measured rate and the expected search time to the file; `--gpu-params` reads it, and explicit `--gpu-*` flags or `-c` win over it. Parameters tuned on one GPU model work on another (with a warning) but may be slower.
+
+Measured on a Tesla T4 (g4dn.xlarge: 40 SMs, 70 W, 4 vCPUs), `sp1qqgmlnmarkets`, from a `bench-gpu` sweep (the timings reproduce within about 1%):
+
+| configuration | rate |
+| ------------- | ---- |
+| CPU only, 4 threads | 60 M/s |
+| H 1024 × 163 840 walks, block 64 / 128 / 256 / 512 | 5.94 / 5.94 / 6.10 / 6.06 G/s |
+| block 256, registers capped from 110 to 80 / 64 (spilling) | 5.91 / 5.22 G/s |
+| block 256, H 128 / 256 / 512 / 1024 / 2048 / 4096 (same scratch memory) | 5.16 / 5.67 / 5.99 / 6.10 / 6.24 / 6.15 G/s |
+| H 1024, 40 960 to 327 680 walks | 6.01 to 6.11 G/s |
+| **best: H 2048 × 122 880 walks, block 256** | **6.19 G/s** |
+| best + 2 CPU threads | 6.11 G/s (−1.4%) |
+
+That is a 2^36-offset range every 33 s, and about 8.4 days of one T4 on average for `sp1qqgmlnmarkets` (2^52 ≈ 4.5 P candidates); with several GPUs each sweeps its own ranges, so the rate should add up (`bench-gpu` times all devices together at the end; only a single GPU was available for this measurement). Walk counts are multiples of what the device runs at once (here 40 SMs × 2 blocks × 256), so that no launch ends on a partial wave.
+
+**Spot instances.** A split-key search is deterministic, so an interrupted run must know what it already swept: run it with `--checkpoint` (see [Interrupting and resuming](#seed-recoverable-keys-split-key-mode)). The file is rewritten every 10 s and when a SIGTERM stops the search, so a reclaim loses only the ranges in flight (tens of seconds of GPU time each; a hard kill without SIGTERM also loses the ranges finished in the last 10 s). The file must outlive the instance: keep it on a volume that survives (a persistent spot request with the *stop* interruption behaviour keeps the root volume), or mirror it. `scripts/spot-search.sh` does all of it:
+
+```
+BASE=02…33-byte-hex PATTERN=sp1qqgmlnmarkets S3=s3://my-bucket/spaghetti scripts/spot-search.sh
+```
+
+It restores the checkpoint, the matches and the tuned parameters from S3 when the local copies are missing (a fresh instance), tunes once per GPU model, runs the search with `--gpu-params` and `--checkpoint`, appends matches to `found.txt`, mirrors the state to S3 every minute, watches the instance metadata for the two-minute spot interruption notice (then stops the search so it saves its checkpoint), and exits 0 once the search is complete. To start it at every boot:
+
+```
+# /etc/systemd/system/spaghetti.service
+[Unit]
+Description=spaghetti vanity search
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=ubuntu
+Environment=BASE=02… PATTERN=sp1qqgmlnmarkets S3=s3://my-bucket/spaghetti BIN=/home/ubuntu/spaghetti/target/release/spaghetti
+ExecStart=/home/ubuntu/spaghetti/scripts/spot-search.sh
+Restart=on-failure
+RestartSec=30
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
+```
+
+(`systemctl enable --now spaghetti`, `journalctl -fu spaghetti` for the progress.)
+
 ## How it works
 
 Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on the CPU:
@@ -178,6 +257,8 @@ Per thread, [VanitySearch](https://github.com/JeanLucPons/VanitySearch)-style on
 Split-key mode reuses the same walk with centre `D + k0·G`, taking `2^36`-offset ranges from a shared queue; `recover` reuses it with generator `−2^K·G` and centre `s·λ^{-e}·B − D` for the giant steps, so the giant-step rate is the walk rate minus a table lookup (an 8 MB bitmap filter in front of a bucketed sorted array of the top 64 bits of `x`).
 
 **GPU** (`src/gpu.rs`, `src/gpu/search.metal`, feature `gpu`). One Metal thread owns one walk and runs the same batch: differences to the table points, prefix products into a per-walk slice of a device buffer, one Fermat inversion, the backward pass, the pair formulas and the endomorphism test, then the jump. The pattern test on the GPU is the top-64-bit key check only; every hit goes back to the host as `(walk, batch, offset, e, x)` and takes the CPU search's slow path unchanged (`resolve_hit`: k256 reconstruction of the scalar, x re-derived and compared, parity fix, then the final address check), so nothing the GPU computes is trusted. The host keeps every walk's start scalar (in a zeroizing vector; the GPU buffers only ever hold public points) and advances it by `2H+1` per batch; random mode reseeds a walk after its first hit like the CPU worker, split mode gives each walk a `2^36 / walks` slice of the current range. The field arithmetic is 8×32-bit limbs (the GPU ALUs are 32-bit): a Karatsuba level over column-wise 32×32→64 limb products, reduced like `reduce_wide`; each operation is tested against the CPU field, and a match-everything pattern test checks every visited x of a batch against k256. A dispatch is a few batches per walk, adapted to last about 150 ms.
+
+**CUDA** (`src/cuda.rs`, `src/cuda/search.cu`, feature `cuda`). The same host protocol and batch as the Metal engine, one host thread per device. NVRTC compiles the kernel at start-up for the GPU found (PTX for its architecture, which the driver turns into machine code and caches), with `H`, the block shape and the pattern keys as compile-time constants, so the per-point key test is a handful of literal compares. The field arithmetic is canonical 8×32-bit limbs with PTX carry chains (`mad.lo.cc`/`madc.hi.cc`): a row-wise product, a dedicated squaring (28 cross products doubled plus the diagonal), and the two-fold reduction of `reduce_wide`; every operation is tested against the CPU field on edge cases, and the walk against k256 with a match-everything pattern. The prefix products live in two planes of device memory indexed `j·walks + t`, so a warp's loads and stores are contiguous; the table is read through the read-only cache, where a warp's identical addresses are one broadcast. Split mode moves every walk to its slice of the next range with one point addition on the GPU (`shift`, `Δ = (next − current)·2^36 − batches·(2H+1)` is the same for all walks) rather than a scalar multiplication per walk on the host, and seeds the first range with one scalar multiplication per CPU core plus additions and one batched normalisation. `unsafe` is confined to the kernel launches (untyped argument lists) and the test kernels.
 
 Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit implementation of `p = 2^256 − 2^32 − 977` written as explicit carry chains the compiler turns into add-with-carry sequences, with the rare reduction cases out of line; it is checked against a big-integer reference in the tests. The default build has no `unsafe` and no assembly (the `gpu` build's `unsafe` is confined to the Metal glue: reading the shared buffers and two binding calls that take a raw pointer). `cargo build --release --features asm` swaps in AArch64 inline assembly for the field operations (`src/field/aarch64.rs`, tested against the portable code); on an Apple M3 it measured level with the default, which the compiler already compiles to the same multiply and add-with-carry chains, so it is only worth trying on other ARM cores. The per-point visitors of the batch loop are trait implementations rather than closures so that they are inlined into it. `k256` is used only for scalar arithmetic, setup and verification. Cross-check: the BIP352 test vector address is a unit test (`src/address.rs`).
 
@@ -198,6 +279,8 @@ Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit impleme
 cargo test                                  # field reference tests, BIP352 + BIP32 vectors, search vs k256, split-key flow
 cargo test --features gpu                   # + the Metal kernel against the CPU field and k256 (macOS; skipped without a GPU)
 cargo test --release --features gpu bench -- --ignored --nocapture   # GPU field-operation rates
+cargo test --release --features cuda        # + the CUDA kernel against the CPU field and k256 (skipped without a GPU)
+cargo test --release --features cuda gpu::bench -- --ignored --nocapture   # CUDA field-operation rates
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
