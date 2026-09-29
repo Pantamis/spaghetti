@@ -545,3 +545,117 @@ fn checkpoint_resumes_from_its_prefix() {
     assert!(ok, "{err}");
     assert!(err.contains("resuming: 5 of"), "{err}");
 }
+
+/// BIP32 test vector 1's master key (seed 000102…0f) as a tprv.
+const ROOT_TPRV: &str = "tprv8ZgxMBicQKsPeDgjzdC36fs6bMjGApWDNLR9erAXMs5skhMv36j9MV5ecvfavji5khqjWaWSFhN3YcCUUdiKH6isR4Pwy3U5y5egddBr16m";
+
+/// `--root-key-file`: the BIP352 keys derived from a root tprv drive a
+/// regtest split-key search (base key and the wallet's spend key in the
+/// address), `recover` and `apply` from the same file, and the network and
+/// key-source checks.
+#[test]
+fn root_key_file_derives_the_bip352_keys() {
+    let root = TempPath::with_content("root.tprv", &format!("{ROOT_TPRV}\n"));
+    // The base key D: apply with the neutral tweak prints d·G.
+    let (ok, out, err) = spaghetti(&[
+        "apply",
+        "--root-key-file",
+        root.as_str(),
+        "--tweak",
+        "0/0/+",
+    ]);
+    assert!(ok, "{err}");
+    assert!(err.contains("m/352'/1'/0'/1'/0"), "{err}");
+    let base = fields(&out)["vanity scan public key"].clone();
+    let spend = fields(&out)["wallet spend pubkey"].clone();
+    assert_ne!(base, spend);
+    // Account 1 is another key.
+    let (ok, out, _) = spaghetti(&[
+        "apply",
+        "--root-key-file",
+        root.as_str(),
+        "--account",
+        "1",
+        "--tweak",
+        "0/0/+",
+    ]);
+    assert!(ok);
+    assert_ne!(fields(&out)["vanity scan public key"], base);
+
+    // Search from the root key = search from -b D, with the wallet's spend key.
+    let (ok, out, err) = spaghetti(&[
+        "-q",
+        "-c",
+        "2",
+        "-n",
+        "regtest",
+        "--root-key-file",
+        root.as_str(),
+        "sprt1qq?pa",
+    ]);
+    assert!(ok, "{err}");
+    let found = fields(&out);
+    assert_eq!(found["base scan pubkey"], base);
+    assert!(found["spend public key"].starts_with(&spend), "{out}");
+    let addr = found["address"].clone();
+    let tweak = found["tweak"].clone();
+    assert!(addr.starts_with("sprt1qq"), "{addr}");
+
+    // recover from the root key finds the same tweak.
+    let (ok, out, err) = spaghetti(&[
+        "recover",
+        "--address",
+        &addr,
+        "--root-key-file",
+        root.as_str(),
+        "--baby-bits",
+        "16",
+    ]);
+    assert!(ok, "{err}");
+    assert_eq!(fields(&out)["tweak"], tweak);
+
+    // apply from the root key: the scan key matches and so does the spend key.
+    let (ok, out, err) = spaghetti(&[
+        "apply",
+        "--root-key-file",
+        root.as_str(),
+        "--tweak",
+        &tweak,
+        "--address",
+        &addr,
+    ]);
+    assert!(ok, "{err}");
+    let applied = fields(&out);
+    assert_eq!(
+        applied["vanity scan public key"],
+        found["vanity scan pubkey"]
+    );
+    assert!(out.contains("spend key is the wallet's"), "{out}");
+
+    // Mismatches and conflicts.
+    let (ok, _, err) = spaghetti(&["-q", "--root-key-file", root.as_str(), "sp1qq?pa"]);
+    assert!(
+        !ok && err.contains("tprv") && err.contains("mainnet"),
+        "{err}"
+    );
+    let (ok, _, err) = spaghetti(&[
+        "-q",
+        "-n",
+        "regtest",
+        "-b",
+        &base,
+        "--root-key-file",
+        root.as_str(),
+        "sprt1qq?pa",
+    ]);
+    assert!(!ok && err.contains("cannot be used with"), "{err}");
+    let (ok, _, err) = spaghetti(&["apply", "--tweak", "0/0/+"]);
+    assert!(!ok && err.contains("--scan-priv-file"), "{err}");
+    // stdin works too.
+    let (ok, out, err) = spaghetti_stdin(
+        &["apply", "--root-key-file", "-", "--tweak", "0/0/+"],
+        ROOT_TPRV,
+    );
+    assert!(ok, "{err}");
+    assert_eq!(fields(&out)["vanity scan public key"], base);
+}

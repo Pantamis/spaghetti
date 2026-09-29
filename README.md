@@ -27,6 +27,7 @@ spaghetti -k 3 pasta penne      # any-of, stop after 3 matches
 spaghetti -s 02…33-byte-hex pasta   # render the example address with a real spend key
 spaghetti -b 02…33-byte-hex pasta   # split-key mode: seed-recoverable key (see below)
 spaghetti --xpub xpub6… pasta       # same, base key from the xpub of m/352'/0'/0'/1'
+spaghetti -n regtest --root-key-file root.tprv sprt1qqgpasta   # same, keys derived from the wallet's root key
 spaghetti --output key.txt pasta    # secret goes to a new 0600 file, not to the terminal
 spaghetti --gpu farfalle            # GPU + CPU threads (build with --features gpu; -c 0 for the GPU alone)
 spaghetti -b 02… --from-range 1234 pasta   # continue an interrupted split-key search (value shown in its progress line)
@@ -36,6 +37,7 @@ spaghetti bench-gpu sp1qqgmlnmarkets       # CUDA: time GPU configurations here,
 spaghetti --gpu-params gpu-params.txt --checkpoint run.ckpt -b 02… sp1qqgmlnmarkets   # CUDA, all GPUs
 spaghetti recover --address sp1qq… -b 02…   # find the tweak of a published address
 spaghetti apply --scan-priv-file d.hex --tweak 48213946821/1/-   # wallet scan key (- = stdin)
+spaghetti apply --root-key-file - --tweak 48213946821/1/- --address sp1qq…   # same, d derived from the root key
 ```
 
 ```
@@ -52,6 +54,10 @@ spaghetti [OPTIONS] <PATTERN>...
   -b, --base-pubkey <HEX33>    split-key mode: search offsets from this compressed scan pubkey D
       --xpub <XPUB>            split-key mode: D = child 0 (non-hardened) of this extended pubkey (xpub or tpub);
                                give the node m/352'/0'/0'/1' (testnet, signet, regtest: m/352'/1'/0'/1', tpub). Mutually exclusive with -b.
+      --root-key-file <PATH>   split-key mode: derive D from the wallet's root extended private key in this
+                               file (xprv; tprv on test networks; - = stdin) at m/352'/coin'/account'/1'/0, and
+                               render the address with its spend key m/352'/coin'/account'/0'/0
+      --account <N>            BIP352 account of --root-key-file [default: 0]
       --output <PATH>          write each match, secret included, to this new file (mode 0600, never
                                overwritten) and print it without the secret line; random mode only
       --from-range <N>         split-key mode: skip the first N ranges of 2^36 offsets (the progress
@@ -75,8 +81,10 @@ CUDA builds (--features cuda) instead of --gpu (Metal):
 spaghetti bench-gpu [PATTERN]... [--output gpu-params.txt] [--gpu-devices LIST] [--seconds 4] [--quick]
 
 spaghetti recover --address <SP_ADDRESS> (-b <HEX33> | --xpub <XPUB>) [-c N] [--baby-bits K]
-spaghetti apply --scan-priv-file <PATH> --tweak <t/e/s> [--address <SP_ADDRESS>] [--output <PATH>]
+spaghetti apply (--scan-priv-file <PATH> | --root-key-file <PATH> [--account N]) --tweak <t/e/s> [--address <SP_ADDRESS>] [--output <PATH>]
 ```
+
+`--root-key-file` (search, `recover` and `apply`) takes the wallet's root extended private key, the depth-0 `xprv`/`tprv` a wallet exports (Bitcoin Core: `listdescriptors true`), and derives the BIP352 keys itself: the scan key `m/352'/coin'/account'/1'/0` and the spend key `m/352'/coin'/account'/0'/0`, with coin type 0 for an `xprv` and 1 for a `tprv` (testnet, signet and regtest share it); an `xprv` with `-n regtest`, or a `tprv` on mainnet, is refused. In a search it gives `D` (printed on stderr) and the wallet's own spend key for the example address, so the printed address is the wallet's real unlabelled address; `apply --root-key-file` also says whether `--address` carries the wallet's spend key. The file is read like `--scan-priv-file` (`-` for stdin, contents wiped from memory after use).
 
 Output per match (stdout; progress goes to stderr):
 
@@ -267,6 +275,7 @@ Field arithmetic (`src/field.rs`) is a purpose-built canonical 4×64-bit impleme
 
 - The scan key **only reveals incoming payments** (it lets the holder detect outputs, not spend them), but treat it like any wallet secret: whoever has it can link every payment to you.
 - **Random mode is for throwaway or test keys.** Its key is not BIP32-derived: wallets derive the scan key from the seed (`m/352'/0'/0'/1'/0`), so such a key cannot be recovered from the seed phrase, and it exists in this program's memory and output. **Split-key mode is the way to mine a key for a real wallet**: `spaghetti` only ever sees the public base key and prints a public tweak; the secret is computed by `apply`, which reads `d` from a file or stdin, never from the command line.
+- `--root-key-file` hands the program the key to the whole wallet, spend keys included. Use it where you would use the wallet itself; on a machine you do not fully trust, such as a rented cloud GPU, search with `-b <D>` or `--xpub` instead (print `D` locally with `spaghetti apply --root-key-file - --tweak 0/0/+`, the neutral tweak) and run `apply` at home. A split-key search needs only `D`.
 - `--output` writes the secret to a new file with mode 0600 and refuses to overwrite an existing one; stdout then carries everything but the secret line. Secrets (scalars, their hex, the file read by `apply`) are held in zeroizing wrappers and wiped when dropped. Both are best effort: the OS can still swap or core-dump the process.
 - Operational rules for a real key: build from source and verify the commit signature, run offline, use encrypted swap (or none), do not run inside a terminal that logs its scrollback, and if the key must travel pipe `--output` through `age` or `gpg` rather than copying the plaintext file.
 - Keys come from the OS RNG (`getrandom` via `k256`); the search walks a public additive sequence from that random start, so every found key is as unpredictable as its start point. With `--gpu` the start scalars stay on the host: the GPU sees only the public walk centres and table, and reports public x coordinates.

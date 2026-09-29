@@ -2,6 +2,13 @@
 //! non-hardened child. Enough to turn the xpub of `m/352'/coin'/account'/1'`
 //! into the scan public key at `…/1'/0`; [`scan_account_pubkey`] also checks
 //! that the xpub sits at that node (depth 4, child `1'`).
+//!
+//! And from a wallet's root extended *private* key (`xprv`/`tprv`, depth 0),
+//! the BIP352 keys of an account ([`bip352_from_root`]): the scan secret at
+//! `m/352'/coin'/account'/1'/0` and the spend public key at
+//! `m/352'/coin'/account'/0'/0`, `coin` being 0 for an `xprv` and 1 for a
+//! `tprv` (testnet, signet and regtest). Secret intermediates (keys, chain
+//! codes, HMAC outputs) are held in zeroizing wrappers.
 
 use hmac::{Hmac, KeyInit, Mac};
 use k256::elliptic_curve::Group;
@@ -9,6 +16,7 @@ use k256::elliptic_curve::PrimeField;
 use k256::elliptic_curve::sec1::ToSec1Point;
 use k256::{ProjectivePoint, PublicKey, Scalar};
 use sha2::{Digest, Sha256, Sha512};
+use zeroize::Zeroizing;
 
 use crate::address::Network;
 
@@ -111,6 +119,183 @@ fn parse(text: &str) -> Result<Xpub, String> {
         child,
         chain_code,
         key,
+    })
+}
+
+/// An extended private key; key and chain code are wiped on drop.
+struct Xprv {
+    /// `tprv` (test networks) rather than `xprv`.
+    test: bool,
+    depth: u8,
+    child: u32,
+    parent_fingerprint: [u8; 4],
+    chain_code: Zeroizing<[u8; 32]>,
+    key: Zeroizing<Scalar>,
+}
+
+/// Base58check-decodes and parses an `xprv`/`tprv`.
+fn parse_xprv(text: &str) -> Result<Xprv, String> {
+    let what = "root key";
+    let raw = Zeroizing::new(
+        bs58::decode(text.trim())
+            .into_vec()
+            .map_err(|_| format!("{what}: not base58"))?,
+    );
+    if raw.len() != 82 {
+        return Err(format!(
+            "{what}: expected an extended private key (82 base58check bytes), got {} bytes",
+            raw.len()
+        ));
+    }
+    let (payload, checksum) = raw.split_at(78);
+    let digest = Sha256::digest(Sha256::digest(payload));
+    if digest[..4] != *checksum {
+        return Err(format!("{what}: bad base58check checksum"));
+    }
+    let test = match payload[..4] {
+        [0x04, 0x88, 0xAD, 0xE4] => false,
+        [0x04, 0x35, 0x83, 0x94] => true,
+        [0x04, 0x88, 0xB2, 0x1E] | [0x04, 0x35, 0x87, 0xCF] => {
+            return Err(format!(
+                "{what}: this is an extended *public* key; the hardened BIP352 path needs the \
+                 xprv/tprv (or pass the account xpub with --xpub)"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "{what}: unknown version bytes {}",
+                hex::encode(&payload[..4])
+            ));
+        }
+    };
+    if payload[45] != 0 {
+        return Err(format!("{what}: private key bytes must start with 0x00"));
+    }
+    let mut key_bytes = Zeroizing::new([0u8; 32]);
+    key_bytes.copy_from_slice(&payload[46..78]);
+    let key = Scalar::from_repr_vartime((*key_bytes).into())
+        .filter(|k| !bool::from(k.is_zero()))
+        .map(Zeroizing::new)
+        .ok_or_else(|| format!("{what}: private key is zero or not below the curve order"))?;
+    let mut chain_code = Zeroizing::new([0u8; 32]);
+    chain_code.copy_from_slice(&payload[13..45]);
+    let mut parent_fingerprint = [0u8; 4];
+    parent_fingerprint.copy_from_slice(&payload[5..9]);
+    Ok(Xprv {
+        test,
+        depth: payload[4],
+        child: u32::from_be_bytes([payload[9], payload[10], payload[11], payload[12]]),
+        parent_fingerprint,
+        chain_code,
+        key,
+    })
+}
+
+/// Child `index` (hardened when `>= 2^31`) of an extended private key:
+/// `k_i = I_L + k` with `I = HMAC-SHA512(c, 0x00 ‖ ser256(k) ‖ ser32(i))`
+/// (hardened) or `HMAC-SHA512(c, ser_P(k·G) ‖ ser32(i))`, `c_i = I_R`.
+fn derive_private(parent: &Xprv, index: u32) -> Result<Xprv, String> {
+    let mut mac = Hmac::<Sha512>::new_from_slice(parent.chain_code.as_slice())
+        .map_err(|_| "root key: internal: hmac key length".to_string())?;
+    if index >= 1 << 31 {
+        let key: Zeroizing<[u8; 32]> = Zeroizing::new(parent.key.to_bytes().into());
+        mac.update(&[0]);
+        mac.update(key.as_slice());
+    } else {
+        let point = ProjectivePoint::GENERATOR * *parent.key;
+        mac.update(point.to_affine().to_sec1_point(true).as_bytes());
+    }
+    mac.update(&index.to_be_bytes());
+    let mut i = Zeroizing::new([0u8; 64]);
+    i.copy_from_slice(&mac.finalize().into_bytes());
+    let mut left = Zeroizing::new([0u8; 32]);
+    left.copy_from_slice(&i[..32]);
+    let tweak = Zeroizing::new(Scalar::from_repr_vartime((*left).into()).ok_or_else(|| {
+        format!(
+            "root key: child {} has I_L >= n (invalid child)",
+            describe_child(index)
+        )
+    })?);
+    let key = Zeroizing::new(tweak.add(&parent.key));
+    if bool::from(key.is_zero()) {
+        return Err(format!(
+            "root key: child {} is the zero key (invalid child)",
+            describe_child(index)
+        ));
+    }
+    let mut chain_code = Zeroizing::new([0u8; 32]);
+    chain_code.copy_from_slice(&i[32..]);
+    Ok(Xprv {
+        test: parent.test,
+        depth: parent.depth.saturating_add(1),
+        child: index,
+        parent_fingerprint: [0; 4],
+        chain_code,
+        key,
+    })
+}
+
+const HARDENED: u32 = 1 << 31;
+
+/// The BIP352 keys of one account of a wallet.
+pub struct WalletKeys {
+    /// The scan secret `d` at `m/352'/coin'/account'/1'/0` (wiped on drop).
+    pub scan: Zeroizing<Scalar>,
+    /// The spend public key at `m/352'/coin'/account'/0'/0`.
+    pub spend: ProjectivePoint,
+    /// `Xpub` for an `xprv` (mainnet), `Tpub` for a `tprv` (test networks).
+    pub version: Version,
+    /// The scan key path, for messages.
+    pub scan_path: String,
+}
+
+/// Derives the BIP352 keys of `account` from a wallet's root extended private
+/// key (depth 0). The coin type follows the key: 0 for an `xprv`, 1 for a
+/// `tprv`.
+pub fn bip352_from_root(text: &str, account: u32) -> Result<WalletKeys, String> {
+    if account >= HARDENED {
+        return Err(format!(
+            "--account: at most {}, got {account}",
+            HARDENED - 1
+        ));
+    }
+    let root = parse_xprv(text)?;
+    if root.depth != 0 || root.child != 0 || root.parent_fingerprint != [0; 4] {
+        return Err(format!(
+            "root key: expected the wallet's root (master) key, depth 0; this one is at depth {} \
+             (child {})",
+            root.depth,
+            describe_child(root.child)
+        ));
+    }
+    let coin = u32::from(root.test);
+    let path = |branch: u32| {
+        [
+            352 | HARDENED,
+            coin | HARDENED,
+            account | HARDENED,
+            branch | HARDENED,
+            0,
+        ]
+    };
+    let derive = |steps: [u32; 5]| -> Result<Xprv, String> {
+        let mut node = derive_private(&root, steps[0])?;
+        for &index in &steps[1..] {
+            node = derive_private(&node, index)?;
+        }
+        Ok(node)
+    };
+    let scan = derive(path(1))?;
+    let spend = derive(path(0))?;
+    Ok(WalletKeys {
+        scan: Zeroizing::new(*scan.key),
+        spend: ProjectivePoint::GENERATOR * *spend.key,
+        version: if root.test {
+            Version::Tpub
+        } else {
+            Version::Xpub
+        },
+        scan_path: format!("m/352'/{coin}'/{account}'/1'/0"),
     })
 }
 
@@ -247,6 +432,142 @@ mod tests {
             derive_child(&parsed, 2).unwrap(),
             derive_child(&parse(PARENT).unwrap(), 2).unwrap()
         );
+    }
+
+    /// BIP32 test vector 1: seed 000102…0f.
+    fn vector_1_master() -> Xprv {
+        let seed: Vec<u8> = (0u8..16).collect();
+        let mut mac = Hmac::<Sha512>::new_from_slice(b"Bitcoin seed").unwrap();
+        mac.update(&seed);
+        let i = mac.finalize().into_bytes();
+        let key: [u8; 32] = i[..32].try_into().unwrap();
+        let chain: [u8; 32] = i[32..].try_into().unwrap();
+        Xprv {
+            test: false,
+            depth: 0,
+            child: 0,
+            parent_fingerprint: [0; 4],
+            chain_code: Zeroizing::new(chain),
+            key: Zeroizing::new(Scalar::from_repr_vartime(key.into()).unwrap()),
+        }
+    }
+
+    /// Serialises an extended private key (test networks: `tprv`).
+    fn serialize_xprv(node: &Xprv) -> String {
+        let mut raw = Vec::with_capacity(82);
+        raw.extend_from_slice(if node.test {
+            &[0x04, 0x35, 0x83, 0x94]
+        } else {
+            &VERSION_XPRV
+        });
+        raw.push(node.depth);
+        raw.extend_from_slice(&node.parent_fingerprint);
+        raw.extend_from_slice(&node.child.to_be_bytes());
+        raw.extend_from_slice(node.chain_code.as_slice());
+        raw.push(0);
+        raw.extend_from_slice(&node.key.to_bytes());
+        let digest = Sha256::digest(Sha256::digest(&raw));
+        raw.extend_from_slice(&digest[..4]);
+        bs58::encode(&raw).into_string()
+    }
+
+    /// Serialises the public side of a node as an xpub/tpub (fingerprint
+    /// left zero: `parse` does not check it).
+    fn serialize_xpub(node: &Xprv) -> String {
+        let mut raw = Vec::with_capacity(82);
+        raw.extend_from_slice(if node.test {
+            &VERSION_TPUB
+        } else {
+            &VERSION_XPUB
+        });
+        raw.push(node.depth);
+        raw.extend_from_slice(&[0; 4]);
+        raw.extend_from_slice(&node.child.to_be_bytes());
+        raw.extend_from_slice(node.chain_code.as_slice());
+        let point = ProjectivePoint::GENERATOR * *node.key;
+        raw.extend_from_slice(point.to_affine().to_sec1_point(true).as_bytes());
+        let digest = Sha256::digest(Sha256::digest(&raw));
+        raw.extend_from_slice(&digest[..4]);
+        bs58::encode(&raw).into_string()
+    }
+
+    /// Private derivation m/0'/1/2' of vector 1 gives the vector's xprv
+    /// (hardened and non-hardened steps), and its public key the vector's xpub.
+    #[test]
+    fn private_derivation_matches_vector_1() {
+        let master = vector_1_master();
+        let root = parse_xprv(&serialize_xprv(&master)).unwrap();
+        assert!(!root.test && root.depth == 0);
+        let a = derive_private(&root, HARDENED).unwrap();
+        let b = derive_private(&a, 1).unwrap();
+        let c = derive_private(&b, 2 | HARDENED).unwrap();
+        let expected = parse_xprv(PARENT_PRV).unwrap();
+        assert_eq!(*c.key, *expected.key);
+        assert_eq!(*c.chain_code, *expected.chain_code);
+        assert_eq!(c.depth, 3);
+        assert_eq!(
+            ProjectivePoint::GENERATOR * *c.key,
+            parse(PARENT).unwrap().key
+        );
+    }
+
+    /// The BIP352 keys from the root agree with the public derivation from
+    /// the account xpub, for both coin types, and the path is checked.
+    #[test]
+    fn bip352_keys_from_root() {
+        for test in [false, true] {
+            let mut master = vector_1_master();
+            master.test = test;
+            let text = serialize_xprv(&master);
+            assert!(
+                text.starts_with(if test { "tprv" } else { "xprv" }),
+                "{text}"
+            );
+            let keys = bip352_from_root(&text, 3).unwrap();
+            let coin = u32::from(test);
+            assert_eq!(keys.scan_path, format!("m/352'/{coin}'/3'/1'/0"));
+            assert_eq!(
+                keys.version,
+                if test { Version::Tpub } else { Version::Xpub }
+            );
+            let mut node = derive_private(&master, 352 | HARDENED).unwrap();
+            for index in [coin | HARDENED, 3 | HARDENED, 1 | HARDENED] {
+                node = derive_private(&node, index).unwrap();
+            }
+            let (scan_pub, version) = scan_account_pubkey(&serialize_xpub(&node)).unwrap();
+            assert_eq!(version, keys.version);
+            assert_eq!(scan_pub, ProjectivePoint::GENERATOR * *keys.scan);
+            // The spend key is on the 0' branch, not the scan one.
+            assert_ne!(keys.spend, scan_pub);
+            let other = bip352_from_root(&text, 0).unwrap();
+            assert_ne!(*other.scan, *keys.scan);
+        }
+    }
+
+    #[test]
+    fn root_key_errors() {
+        let master = vector_1_master();
+        let child = derive_private(&master, HARDENED).unwrap();
+        let err = bip352_from_root(&serialize_xprv(&child), 0)
+            .err()
+            .expect("an error");
+        assert!(err.contains("depth 1"), "{err}");
+        let err = bip352_from_root(PARENT, 0).err().expect("an error");
+        assert!(err.contains("*public*"), "{err}");
+        let err = bip352_from_root(&serialize_xprv(&master), HARDENED)
+            .err()
+            .expect("an error");
+        assert!(err.contains("--account"), "{err}");
+        let mut text = serialize_xprv(&master);
+        text.replace_range(20..21, if &text[20..21] == "a" { "b" } else { "a" });
+        assert!(
+            bip352_from_root(&text, 0)
+                .err()
+                .expect("an error")
+                .contains("checksum")
+        );
+        // Surrounding whitespace (a file's newline) is fine.
+        assert!(bip352_from_root(&format!("  {}\n", serialize_xprv(&master)), 0).is_ok());
     }
 
     #[test]

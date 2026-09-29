@@ -250,13 +250,31 @@ fn gpu_config(_cli: &Cli) -> Result<(Option<()>, Option<usize>), String> {
 #[derive(Args)]
 struct BaseKeyArgs {
     /// split-key mode: search offsets from this compressed scan pubkey D
-    #[arg(short = 'b', long, value_name = "HEX33", conflicts_with = "xpub")]
+    #[arg(short = 'b', long, value_name = "HEX33", conflicts_with_all = ["xpub", "root_key_file"])]
     base_pubkey: Option<String>,
 
     /// split-key mode: D = child 0 (non-hardened) of this extended pubkey; give the node
     /// m/352'/0'/0'/1' (testnet, signet, regtest: m/352'/1'/0'/1', tpub). Mutually exclusive with -b.
-    #[arg(long, value_name = "XPUB")]
+    #[arg(long, value_name = "XPUB", conflicts_with = "root_key_file")]
     xpub: Option<String>,
+
+    #[command(flatten)]
+    root: RootKeyArgs,
+}
+
+/// The wallet's root extended private key, from which the BIP352 keys are
+/// derived.
+#[derive(Args)]
+struct RootKeyArgs {
+    /// file holding the wallet's root extended private key (xprv; tprv on testnet, signet,
+    /// regtest); `-` = stdin. The BIP352 keys are derived from it: scan m/352'/coin'/account'/1'/0,
+    /// spend m/352'/coin'/account'/0'/0 (coin 0 for xprv, 1 for tprv)
+    #[arg(long, value_name = "PATH")]
+    root_key_file: Option<PathBuf>,
+
+    /// BIP352 account of --root-key-file
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    account: u32,
 }
 
 #[derive(Subcommand)]
@@ -327,8 +345,16 @@ struct RecoverArgs {
 #[derive(Args)]
 struct ApplyArgs {
     /// file holding the hex BIP32-derived scan secret key d (m/352'/coin'/account'/1'/0); `-` = stdin
-    #[arg(long, value_name = "PATH")]
-    scan_priv_file: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        required_unless_present = "root_key_file",
+        conflicts_with = "root_key_file"
+    )]
+    scan_priv_file: Option<PathBuf>,
+
+    #[command(flatten)]
+    root: RootKeyArgs,
 
     /// tweak string `<t>/<e>/<s>` printed by the search or by `recover`
     #[arg(long, value_name = "t/e/s")]
@@ -390,9 +416,15 @@ impl Search {
     fn from_args(cli: Cli) -> Result<Search, String> {
         let network = cli.network;
         let patterns = PatternSet::parse(&cli.patterns, network)?;
-        let spend = match &cli.spend_pubkey {
-            Some(text) => parse_pubkey(text, "--spend-pubkey")?,
-            None => ProjectivePoint::GENERATOR * search::random_scalar()?,
+        let base = parse_base_key_full(&cli.base, network)?;
+        // The example address: -s, else the wallet's spend key when the root
+        // key is given, else a throwaway key.
+        let wallet_spend = base.as_ref().and_then(|b| b.spend);
+        let spend_provided = cli.spend_pubkey.is_some() || wallet_spend.is_some();
+        let spend = match (&cli.spend_pubkey, wallet_spend) {
+            (Some(text), _) => parse_pubkey(text, "--spend-pubkey")?,
+            (None, Some(spend)) => spend,
+            (None, None) => ProjectivePoint::GENERATOR * search::random_scalar()?,
         };
         let (gpu, cores_hint) = gpu_config(&cli)?;
         // With the Metal GPU, CPU workers still help (about +25% on an M3
@@ -409,8 +441,8 @@ impl Search {
         if cli.count == 0 {
             return Err("--count must be at least 1".to_string());
         }
-        let mode = match parse_base_key(&cli.base, network)? {
-            Some(base) => Mode::Split { base },
+        let mode = match base {
+            Some(base) => Mode::Split { base: base.point },
             None => Mode::Random,
         };
         // Split mode hands out SPLIT_RANGES offset ranges from a queue: more OS
@@ -519,7 +551,7 @@ impl Search {
             gpu,
             count: cli.count,
             spend: compressed(&spend),
-            spend_provided: cli.spend_pubkey.is_some(),
+            spend_provided,
             output: cli.output,
             quiet: cli.quiet,
         })
@@ -1220,7 +1252,21 @@ fn run_bench_gpu(args: &BenchArgs) -> Result<(), String> {
 }
 
 fn run_apply(args: &ApplyArgs) -> Result<(), String> {
-    let d = read_secret_file(&args.scan_priv_file)?;
+    let address_network = match &args.address {
+        Some(addr) => Some(parse_address(addr)?.0),
+        None => None,
+    };
+    let (d, wallet_spend) = match (&args.root.root_key_file, &args.scan_priv_file) {
+        (Some(path), _) => {
+            let keys = wallet_keys(path, args.root.account, address_network)?;
+            eprintln!("scan key d = {} of the root key", keys.scan_path);
+            (keys.scan, Some(keys.spend))
+        }
+        (None, Some(path)) => (read_secret_file(path)?, None),
+        (None, None) => {
+            return Err("apply needs --scan-priv-file or --root-key-file".to_string());
+        }
+    };
     let secret = Zeroizing::new(args.tweak.apply(&d));
     if *secret == Scalar::ZERO {
         return Err("the tweak maps this key to zero; it cannot be a valid scan key".to_string());
@@ -1236,6 +1282,21 @@ fn run_apply(args: &ApplyArgs) -> Result<(), String> {
             ));
         }
     }
+    // With the root key, also whether the address carries the wallet's
+    // (unlabelled) spend key.
+    let spend_note = match (&args.address, wallet_spend) {
+        (Some(addr), Some(spend)) => {
+            let (_, _, address_spend) =
+                address::decode(addr.trim()).map_err(|e| format!("--address: {e}"))?;
+            if address_spend == compressed(&spend) {
+                ", spend key is the wallet's"
+            } else {
+                ", spend key is not the wallet's base spend key (a labelled address, or an \
+                 example spend key)"
+            }
+        }
+        _ => "",
+    };
     let write = |out: &mut dyn Write, secret_line: SecretLine| -> io::Result<()> {
         writeln!(
             out,
@@ -1243,10 +1304,17 @@ fn run_apply(args: &ApplyArgs) -> Result<(), String> {
             *secret_line.render(&secret)
         )?;
         writeln!(out, "vanity scan public key: {}", hex::encode(pubkey))?;
+        if let Some(spend) = wallet_spend {
+            writeln!(
+                out,
+                "wallet spend pubkey   : {}",
+                hex::encode(compressed(&spend))
+            )?;
+        }
         if let Some(addr) = &args.address {
             writeln!(
                 out,
-                "address               : {} (scan key matches)",
+                "address               : {} (scan key matches{spend_note})",
                 addr.trim()
             )?;
         }
@@ -1270,9 +1338,15 @@ fn run_apply(args: &ApplyArgs) -> Result<(), String> {
 /// The hex secret key in `--scan-priv-file` (`-` = stdin), trimmed.
 fn read_secret_file(path: &Path) -> Result<Zeroizing<Scalar>, String> {
     let what = "--scan-priv-file";
-    // One allocation for a 64-char hex line plus whitespace: no reallocation
-    // leaves an unwiped copy behind.
-    let mut bytes = Zeroizing::new(Vec::with_capacity(256));
+    let text = read_secret_text(path, what)?;
+    parse_secret(&text, what)
+}
+
+/// The text of a small secret file (`-` = stdin), wiped on drop.
+fn read_secret_text(path: &Path, what: &str) -> Result<Zeroizing<String>, String> {
+    // One allocation for a key line plus whitespace: no reallocation leaves
+    // an unwiped copy behind.
+    let mut bytes = Zeroizing::new(Vec::with_capacity(512));
     let read = if path == Path::new("-") {
         io::stdin().lock().read_to_end(&mut bytes)
     } else {
@@ -1280,7 +1354,7 @@ fn read_secret_file(path: &Path) -> Result<Zeroizing<Scalar>, String> {
     };
     read.map_err(|e| format!("{what}: {}: {e}", path.display()))?;
     let text = std::str::from_utf8(&bytes).map_err(|_| format!("{what}: not UTF-8 text"))?;
-    parse_secret(text, what)
+    Ok(Zeroizing::new(text.trim().to_string()))
 }
 
 // ---- argument parsing -------------------------------------------------------
@@ -1303,9 +1377,65 @@ fn point_from_sec1(bytes: &[u8; 33], what: &str) -> Result<ProjectivePoint, Stri
         .map_err(|_| format!("{what}: not a valid secp256k1 public key"))
 }
 
-/// Base scan pubkey `D` from `-b` or `--xpub` (clap rejects both), checked
-/// against `network`.
+/// The base scan pubkey `D` and, from a root key, the wallet's spend key.
+struct BaseKey {
+    point: ProjectivePoint,
+    spend: Option<ProjectivePoint>,
+}
+
+/// Base scan pubkey `D` from `-b`, `--xpub` or `--root-key-file` (clap
+/// rejects more than one), checked against `network`.
 fn parse_base_key(args: &BaseKeyArgs, network: Network) -> Result<Option<ProjectivePoint>, String> {
+    Ok(parse_base_key_full(args, network)?.map(|b| b.point))
+}
+
+fn parse_base_key_full(args: &BaseKeyArgs, network: Network) -> Result<Option<BaseKey>, String> {
+    if let Some(path) = &args.root.root_key_file {
+        let keys = wallet_keys(path, args.root.account, Some(network))?;
+        let point = ProjectivePoint::GENERATOR * *keys.scan;
+        eprintln!(
+            "base scan pubkey {} = {} of the root key",
+            hex::encode(compressed(&point)),
+            keys.scan_path
+        );
+        return Ok(Some(BaseKey {
+            point,
+            spend: Some(keys.spend),
+        }));
+    }
+    let point = parse_base_key_public(args, network)?;
+    Ok(point.map(|point| BaseKey { point, spend: None }))
+}
+
+/// The BIP352 keys of `account` from the root key in `path` (`-` = stdin),
+/// checked against `network` when known.
+fn wallet_keys(
+    path: &Path,
+    account: u32,
+    network: Option<Network>,
+) -> Result<bip32::WalletKeys, String> {
+    let what = "--root-key-file";
+    let text = read_secret_text(path, what)?;
+    let keys = bip32::bip352_from_root(&text, account).map_err(|e| format!("{what}: {e}"))?;
+    if let Some(network) = network
+        && keys.version != bip32::Version::of(network)
+    {
+        let (kind, fits) = match keys.version {
+            bip32::Version::Xpub => ("an xprv", "mainnet"),
+            bip32::Version::Tpub => ("a tprv", "testnet, signet or regtest"),
+        };
+        return Err(format!(
+            "{what} is {kind} ({fits}) but the network is {}",
+            network.describe()
+        ));
+    }
+    Ok(keys)
+}
+
+fn parse_base_key_public(
+    args: &BaseKeyArgs,
+    network: Network,
+) -> Result<Option<ProjectivePoint>, String> {
     if let Some(hex_key) = &args.base_pubkey {
         return parse_pubkey(hex_key, "--base-pubkey").map(Some);
     }
@@ -1571,20 +1701,30 @@ mod tests {
     /// (the header of an `m/352'/coin'/account'/1'` node).
     const ACCOUNT_XPUB: &str = "xpub6EwK5B8QEa84vLJR7ik6SXv8J5uvxFG5UqdZGqfwQWNqhQfKEd1enZhemimbo7gZw3GJMvfAJsqMYBDsBZHpmBr5j5sECGixfcyhTb4B9jY";
 
+    fn no_root() -> RootKeyArgs {
+        RootKeyArgs {
+            root_key_file: None,
+            account: 0,
+        }
+    }
+
     #[test]
     fn base_key_sources() {
         let none = BaseKeyArgs {
+            root: no_root(),
             base_pubkey: None,
             xpub: None,
         };
         assert!(parse_base_key(&none, Network::Mainnet).unwrap().is_none());
         let wrong_node = BaseKeyArgs {
+            root: no_root(),
             base_pubkey: None,
             xpub: Some(VECTOR_XPUB.to_string()),
         };
         let err = parse_base_key(&wrong_node, Network::Mainnet).unwrap_err();
         assert!(err.contains("depth 3"), "{err}");
         let from_xpub = BaseKeyArgs {
+            root: no_root(),
             base_pubkey: None,
             xpub: Some(ACCOUNT_XPUB.to_string()),
         };
@@ -1598,6 +1738,7 @@ mod tests {
             assert!(err.contains(network.describe()), "{err}");
         }
         let from_hex = BaseKeyArgs {
+            root: no_root(),
             base_pubkey: Some(hex::encode(compressed(&point))),
             xpub: None,
         };
